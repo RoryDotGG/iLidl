@@ -1,0 +1,78 @@
+# iLidl
+
+Unofficial Python client and CLI for the Lidl Plus API. Fetch receipts, parse item details, and manage coupons.
+
+## Installation
+
+```bash
+uv pip install -e .
+
+# With auth support (requires Playwright for login)
+uv pip install -e ".[auth]"
+playwright install chromium
+```
+
+## Authentication
+
+```bash
+ilidl login
+```
+
+Launches a headless browser to complete the Lidl Plus OAuth flow. You'll be prompted for your email and password. A refresh token is saved to `~/.config/ilidl/config.toml` for future use.
+
+## CLI Usage
+
+```bash
+# Receipts
+ilidl receipt latest              # Most recent receipt
+ilidl receipt latest --json       # As JSON
+ilidl receipt <id>                # Specific receipt
+ilidl receipts                    # List all receipts
+ilidl receipts --from 2026-03-01  # Filter by date
+ilidl receipts --to 2026-03-18
+
+# Coupons
+ilidl coupons list                # List available coupons
+ilidl coupons activate <id>       # Activate a coupon
+ilidl coupons activate --all      # Activate all coupons
+ilidl coupons deactivate <id>     # Deactivate a coupon
+```
+
+All commands support `--json` for machine-readable output.
+
+## Library Usage
+
+```python
+from ilidl import LidlClient
+
+client = LidlClient(refresh_token="...", country="GB", language="en")
+
+# Get latest receipt with parsed items
+receipt = client.latest_receipt()
+for item in receipt.items:
+    print(f"{item.name}: {item.price}")
+
+# List coupons
+for coupon in client.coupons():
+    print(f"{coupon.title} (active: {coupon.is_activated})")
+```
+
+## Configuration
+
+Stored at `~/.config/ilidl/config.toml`:
+
+```toml
+[auth]
+refresh_token = "..."
+
+[account]
+language = "en"
+country = "GB"
+```
+
+## Notes
+
+- UK receipts are returned as HTML by the API and parsed into structured items using `data-*` attributes.
+- The `App-Version` header must be a realistic value (currently `16.45.5`). The API rejects fake versions.
+- API v2 is used for receipt lists, v3 for receipt detail.
+- This project replaces the upstream `lidl-plus` library which is broken on modern Python.
