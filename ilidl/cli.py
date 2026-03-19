@@ -3,6 +3,7 @@
 import json
 from dataclasses import asdict
 from datetime import datetime
+from typing import Any
 
 import click
 import requests
@@ -23,7 +24,7 @@ def _get_client() -> LidlClient:
     )
 
 
-def _json_serial(obj):
+def _json_serial(obj: Any) -> str:
     if isinstance(obj, datetime):
         return obj.isoformat()
     msg = f"Type {type(obj)} not serializable"
@@ -31,13 +32,13 @@ def _json_serial(obj):
 
 
 @click.group()
-def cli():
+def cli() -> None:
     """Lidl Plus CLI."""
 
 
 @cli.command()
 @click.option("--debug", is_flag=True, help="Save debug screenshots")
-def login(debug):
+def login(*, debug: bool) -> None:
     """Authenticate with Lidl Plus."""
     from ilidl.auth import login as do_login
 
@@ -66,7 +67,11 @@ def login(debug):
     type=click.DateTime(["%Y-%m-%d"]),
     default=None,
 )
-def receipts_cmd(as_json, from_date, to_date):
+def receipts_cmd(
+    as_json: bool,
+    from_date: datetime | None,
+    to_date: datetime | None,
+) -> None:
     """List receipts."""
     client = _get_client()
     all_receipts = client.receipts()
@@ -101,7 +106,7 @@ def receipts_cmd(as_json, from_date, to_date):
 @cli.command("receipt")
 @click.argument("ticket_id")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def receipt_cmd(ticket_id, as_json):
+def receipt_cmd(ticket_id: str, as_json: bool) -> None:
     """Show receipt detail. Use 'latest' for most recent."""
     client = _get_client()
 
@@ -135,13 +140,13 @@ def receipt_cmd(ticket_id, as_json):
 
 
 @cli.group("coupons")
-def coupons_group():
+def coupons_group() -> None:
     """Manage coupons."""
 
 
 @coupons_group.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def coupons_list(as_json):
+def coupons_list(as_json: bool) -> None:
     """List available coupons."""
     client = _get_client()
     all_coupons = client.coupons()
@@ -176,7 +181,7 @@ def coupons_list(as_json):
     is_flag=True,
     help="Activate all coupons",
 )
-def coupons_activate(coupon_id, activate_all):
+def coupons_activate(coupon_id: str | None, activate_all: bool) -> None:
     """Activate a coupon."""
     client = _get_client()
     if activate_all:
@@ -200,7 +205,7 @@ def coupons_activate(coupon_id, activate_all):
 
 @coupons_group.command("deactivate")
 @click.argument("coupon_id")
-def coupons_deactivate(coupon_id):
+def coupons_deactivate(coupon_id: str) -> None:
     """Deactivate a coupon."""
     client = _get_client()
     client.deactivate_coupon(coupon_id)
