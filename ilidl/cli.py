@@ -55,12 +55,14 @@ def login(debug):
 @cli.command("receipts")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option(
-    "--from", "from_date",
+    "--from",
+    "from_date",
     type=click.DateTime(["%Y-%m-%d"]),
     default=None,
 )
 @click.option(
-    "--to", "to_date",
+    "--to",
+    "to_date",
     type=click.DateTime(["%Y-%m-%d"]),
     default=None,
 )
@@ -70,22 +72,18 @@ def receipts_cmd(as_json, from_date, to_date):
     all_receipts = client.receipts()
 
     if from_date:
-        all_receipts = [
-            r for r in all_receipts
-            if r.date.replace(tzinfo=None) >= from_date
-        ]
+        all_receipts = [r for r in all_receipts if r.date.replace(tzinfo=None) >= from_date]
     if to_date:
-        all_receipts = [
-            r for r in all_receipts
-            if r.date.replace(tzinfo=None) <= to_date
-        ]
+        all_receipts = [r for r in all_receipts if r.date.replace(tzinfo=None) <= to_date]
 
     if as_json:
-        click.echo(json.dumps(
-            [asdict(r) for r in all_receipts],
-            default=_json_serial,
-            indent=2,
-        ))
+        click.echo(
+            json.dumps(
+                [asdict(r) for r in all_receipts],
+                default=_json_serial,
+                indent=2,
+            )
+        )
         return
 
     if not all_receipts:
@@ -97,10 +95,7 @@ def receipts_cmd(as_json, from_date, to_date):
     for r in all_receipts:
         date_str = r.date.strftime("%Y-%m-%d %H:%M")
         store_name = r.store.name or r.store.id
-        click.echo(
-            f"{date_str:<20} {store_name:<20} "
-            f"{len(r.items):>5} {r.total:>7.2f}"
-        )
+        click.echo(f"{date_str:<20} {store_name:<20} {len(r.items):>5} {r.total:>7.2f}")
 
 
 @cli.command("receipt")
@@ -110,18 +105,16 @@ def receipt_cmd(ticket_id, as_json):
     """Show receipt detail. Use 'latest' for most recent."""
     client = _get_client()
 
-    receipt = (
-        client.latest_receipt()
-        if ticket_id == "latest"
-        else client.receipt(ticket_id)
-    )
+    receipt = client.latest_receipt() if ticket_id == "latest" else client.receipt(ticket_id)
 
     if as_json:
-        click.echo(json.dumps(
-            asdict(receipt),
-            default=_json_serial,
-            indent=2,
-        ))
+        click.echo(
+            json.dumps(
+                asdict(receipt),
+                default=_json_serial,
+                indent=2,
+            )
+        )
         return
 
     click.echo(f"Receipt: {receipt.id}")
@@ -134,9 +127,7 @@ def receipt_cmd(ticket_id, as_json):
         qty = f"{item.quantity:.2f}" if item.quantity != 1.0 else ""
         click.echo(f"{item.name:<35} {qty:>5} {item.price:>7.2f}")
         for d in item.discounts:
-            click.echo(
-                f"  {d.description:<33} {'':<5} {-d.amount:>7.2f}"
-            )
+            click.echo(f"  {d.description:<33} {'':<5} {-d.amount:>7.2f}")
     click.echo("-" * 50)
     click.echo(f"{'TOTAL':<35} {'':<5} {receipt.total:>7.2f}")
     if receipt.payment_method:
@@ -156,11 +147,13 @@ def coupons_list(as_json):
     all_coupons = client.coupons()
 
     if as_json:
-        click.echo(json.dumps(
-            [asdict(c) for c in all_coupons],
-            default=_json_serial,
-            indent=2,
-        ))
+        click.echo(
+            json.dumps(
+                [asdict(c) for c in all_coupons],
+                default=_json_serial,
+                indent=2,
+            )
+        )
         return
 
     if not all_coupons:
@@ -178,7 +171,8 @@ def coupons_list(as_json):
 @coupons_group.command("activate")
 @click.argument("coupon_id", required=False)
 @click.option(
-    "--all", "activate_all",
+    "--all",
+    "activate_all",
     is_flag=True,
     help="Activate all coupons",
 )
