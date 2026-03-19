@@ -5,10 +5,13 @@ Unofficial Python client and CLI for the Lidl Plus API. Fetch receipts, parse it
 ## Installation
 
 ```bash
-uv pip install -e .
+pip install ilidl
+
+# Or with uv
+uv add ilidl
 
 # With auth support (requires Playwright for login)
-uv pip install -e ".[auth]"
+pip install "ilidl[auth]"
 playwright install chromium
 ```
 
