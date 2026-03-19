@@ -79,15 +79,21 @@ def _dbg(debug: bool, page: Any, name: str, msg: str = "") -> None:
 def login(config: Config, *, debug: bool = False) -> str:
     """Run interactive login via phone number. Returns refresh token."""
     try:
+        from playwright._impl._errors import TimeoutError as PwTimeout
         from playwright.sync_api import sync_playwright
     except ImportError as e:
-        msg = "Playwright is required for login. Install with: uv pip install 'ilidl[auth]'"
+        msg = (
+            "Playwright is required for login. "
+            "Install with: uv pip install 'ilidl[auth]'"
+        )
         raise AuthError(msg) from e
 
     verifier, challenge = _generate_pkce()
     url = _build_auth_url(challenge, config.country, config.language)
 
-    phone = input("Phone number (local, e.g. 7400123456): ").strip()
+    phone = input(
+        "Phone number (local, e.g. 7400123456): "
+    ).strip()
     password = getpass.getpass("Password: ")
 
     with sync_playwright() as p:
@@ -129,20 +135,25 @@ def login(config: Config, *, debug: bool = False) -> str:
         _dbg(debug, page, "01_welcome", f"url: {page.url}")
 
         # Click "Log in" on the welcome page
-        page.locator("button:has-text('Log in'), a:has-text('Log in')").first.click(timeout=5000)
+        page.locator(
+            "button:has-text('Log in'), a:has-text('Log in')"
+        ).first.click(timeout=5000)
         page.wait_for_load_state("networkidle")
         _dbg(debug, page, "02_login_form", "on login form")
 
         # Switch to phone number login
-        page.locator("button:has-text('phone number'), a:has-text('phone number')").first.click(
-            timeout=5000
-        )
+        page.locator(
+            "button:has-text('phone number'), "
+            "a:has-text('phone number')"
+        ).first.click(timeout=5000)
         page.wait_for_load_state("networkidle")
         _dbg(debug, page, "03_phone_form", f"url: {page.url}")
 
         # Fill local phone number (country code is pre-selected)
         phone_field = page.locator(
-            "input[type='tel'], input[name='PhoneNumber'], input[name='phoneNumber']"
+            "input[type='tel'], "
+            "input[name='PhoneNumber'], "
+            "input[name='phoneNumber']"
         ).first
         phone_field.fill(phone)
 
@@ -150,62 +161,78 @@ def login(config: Config, *, debug: bool = False) -> str:
         page.locator("input[type='password']").first.fill(password)
         _dbg(debug, page, "04_filled")
 
-        # Submit and wait for navigation or page change
-        login_url = page.url
-        page.locator("button:has-text('Log in'), button[type='submit']").first.click()
-
-        # Wait for URL to change or for an error/verification
-        # element to appear
-        with contextlib.suppress(TimeoutError):
-            page.wait_for_function(
-                f"window.location.href !== '{login_url}' || "
-                "document.querySelector("
-                '  \'[name="VerificationCode"],'
-                "  .alert-danger,"
-                "  .error-message'"
-                ")",
-                timeout=15000,
-            )
+        # Submit and wait for the page to settle
+        page.locator(
+            "button:has-text('Log in'), "
+            "button[type='submit']"
+        ).first.click()
         page.wait_for_load_state("networkidle")
+
+        # Wait for the next screen: verification code form,
+        # error alert, or redirect (captured by handlers).
+        if not code:
+            next_screen = (
+                "[role='alert'], "
+                "[name='VerificationCode'], "
+                "input[name='code'], "
+                "input[inputmode='numeric']"
+            )
+            with contextlib.suppress(PwTimeout):
+                page.wait_for_selector(
+                    next_screen,
+                    state="visible",
+                    timeout=30000,
+                )
+            page.wait_for_load_state("networkidle")
         _dbg(debug, page, "05_after_submit", f"url: {page.url}")
 
-        # Check for error message
+        # Check for error alert
         if not code:
-            error_el = page.locator(
-                ".alert-danger, .error-message, [class*='error'], [class*='Error']"
-            )
-            if error_el.first.is_visible(timeout=2000):
-                error_text = error_el.first.text_content()
+            alert = page.locator("[role='alert']")
+            if alert.count() > 0 and alert.first.is_visible():
+                error_text = (
+                    alert.first.text_content() or ""
+                ).strip()
                 _dbg(debug, page, "05b_error")
                 browser.close()
                 msg = f"Login failed: {error_text}"
                 raise AuthError(msg)
 
-        # Check for verification code prompt
+        # Handle verification code prompt
         if not code:
             verify_field = page.locator(
-                "[name='VerificationCode'], input[name='code'], input[inputmode='numeric']"
+                "[name='VerificationCode'], "
+                "input[name='code'], "
+                "input[inputmode='numeric']"
             )
             try:
-                if verify_field.first.is_visible(timeout=10000):
-                    _dbg(debug, page, "06_verify_prompt")
-                    otp = input("Enter verification code: ").strip()
-                    verify_field.first.fill(otp)
-                    page.locator(
-                        "button[type='submit'], "
-                        "button:has-text('Submit'), "
-                        "button:has-text('Verify')"
-                    ).first.click()
+                verify_field.first.wait_for(
+                    state="visible", timeout=5000
+                )
+                _dbg(debug, page, "06_verify_prompt")
+                otp = input(
+                    "Enter verification code: "
+                ).strip()
+                verify_field.first.fill(otp)
+                page.locator(
+                    "button[type='submit'], "
+                    "button:has-text('Submit'), "
+                    "button:has-text('Verify')"
+                ).first.click()
 
-                    # Wait for redirect after verify
-                    with contextlib.suppress(TimeoutError):
-                        page.wait_for_url("**/callback*", timeout=15000)
-                    page.wait_for_timeout(3000)
-                    _dbg(debug, page, "07_after_verify", f"url: {page.url}")
-            except Exception as exc:
+                with contextlib.suppress(PwTimeout):
+                    page.wait_for_url(
+                        "**/callback*", timeout=15000
+                    )
+                page.wait_for_timeout(3000)
+                _dbg(
+                    debug, page, "07_after_verify",
+                    f"url: {page.url}",
+                )
+            except PwTimeout:
                 if debug:
-                    print(f"DEBUG verify error: {exc}")
-                _dbg(debug, page, "08_error")
+                    print("DEBUG verify field not found")
+                _dbg(debug, page, "08_no_verify")
 
         browser.close()
 
