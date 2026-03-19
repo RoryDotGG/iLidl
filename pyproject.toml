@@ -2,6 +2,21 @@
 name = "ilidl"
 version = "0.1.0"
 description = "Unofficial Lidl Plus API client"
+readme = "README.md"
+license = "MIT"
+keywords = ["lidl", "lidl-plus", "receipts", "coupons", "api-client"]
+authors = [{ name = "RoryDotGG" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+    "Typing :: Typed",
+]
 requires-python = ">=3.12"
 dependencies = [
     "requests",
@@ -15,6 +30,11 @@ dev = [
     "pytest",
     "ruff",
 ]
+
+[project.urls]
+Homepage = "https://github.com/RoryDotGG/iLidl"
+Repository = "https://github.com/RoryDotGG/iLidl"
+Issues = "https://github.com/RoryDotGG/iLidl/issues"
 
 [project.scripts]
 ilidl = "ilidl.cli:cli"
