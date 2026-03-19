@@ -54,9 +54,7 @@ class LidlClient:
             timeout=TIMEOUT,
         )
         if resp.status_code != 200:
-            msg = (
-                f"Token renewal failed: {resp.status_code} {resp.text}"
-            )
+            msg = f"Token renewal failed: {resp.status_code} {resp.text}"
             raise AuthError(msg)
         data = resp.json()
         self._access_token = data["access_token"]
@@ -108,17 +106,14 @@ class LidlClient:
         page_size = first_page["size"]
         for page in range(2, (total_count // page_size) + 2):
             page_data = self._get(
-                f"{url}?pageNumber={page}"
-                f"&onlyFavorite={only_favourite}",
+                f"{url}?pageNumber={page}&onlyFavorite={only_favourite}",
             )
             tickets.extend(page_data["tickets"])
         return [self._ticket_summary_to_receipt(t) for t in tickets]
 
     def receipt(self, ticket_id: str) -> Receipt:
         """Fetch a single receipt by ID with full detail."""
-        url = (
-            f"{TICKETS_API}/v3/{self._country}/tickets/{ticket_id}"
-        )
+        url = f"{TICKETS_API}/v3/{self._country}/tickets/{ticket_id}"
         data = self._get(url)
         return self._ticket_detail_to_receipt(data)
 
@@ -168,10 +163,7 @@ class LidlClient:
 
     def activate_coupon(self, coupon_id: str) -> None:
         """Activate a coupon by ID."""
-        url = (
-            f"{COUPONS_API}/v1/promotions"
-            f"/{coupon_id}/activation"
-        )
+        url = f"{COUPONS_API}/v1/promotions/{coupon_id}/activation"
         headers = self._auth_headers()
         headers.update(self._coupon_headers())
         resp = requests.post(
@@ -183,10 +175,7 @@ class LidlClient:
 
     def deactivate_coupon(self, coupon_id: str) -> None:
         """Deactivate a coupon by ID."""
-        url = (
-            f"{COUPONS_API}/v2/promotions"
-            f"/{coupon_id}/activation"
-        )
+        url = f"{COUPONS_API}/v2/promotions/{coupon_id}/activation"
         headers = self._auth_headers()
         headers.update(self._coupon_headers())
         resp = requests.delete(
