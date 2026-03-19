@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 import click
+import requests
 
 from ilidl.client import LidlClient
 from ilidl.config import Config
@@ -35,7 +36,8 @@ def cli():
 
 
 @cli.command()
-def login():
+@click.option("--debug", is_flag=True, help="Save debug screenshots")
+def login(debug):
     """Authenticate with Lidl Plus."""
     from ilidl.auth import login as do_login
 
@@ -46,7 +48,7 @@ def login():
     config.country = country
     config.save()
 
-    do_login(config)
+    do_login(config, debug=debug)
     click.echo(f"Logged in. Token saved to {config.path}")
 
 
@@ -186,8 +188,14 @@ def coupons_activate(coupon_id, activate_all):
     if activate_all:
         for c in client.coupons():
             if not c.is_activated:
-                client.activate_coupon(c.id)
-                click.echo(f"Activated: {c.title}")
+                try:
+                    client.activate_coupon(c.id)
+                    click.echo(f"Activated: {c.title}")
+                except requests.HTTPError as e:
+                    click.echo(
+                        f"Skipped: {c.title} ({e.response.status_code})",
+                        err=True,
+                    )
         return
     if not coupon_id:
         click.echo("Provide a coupon ID or use --all", err=True)
