@@ -153,7 +153,7 @@ def login(config: Config, *, debug: bool = False) -> str:
 
         # Wait for URL to change or for an error/verification
         # element to appear
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(TimeoutError):
             page.wait_for_function(
                 f"window.location.href !== '{login_url}' || "
                 "document.querySelector("
@@ -195,7 +195,7 @@ def login(config: Config, *, debug: bool = False) -> str:
                     ).first.click()
 
                     # Wait for redirect after verify
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(TimeoutError):
                         page.wait_for_url("**/callback*", timeout=15000)
                     page.wait_for_timeout(3000)
                     _dbg(debug, page, "07_after_verify", f"url: {page.url}")
