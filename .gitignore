@@ -12,6 +12,7 @@ build/
 # Testing / linting caches
 .pytest_cache/
 .ruff_cache/
+.coverage
 
 # Playwright
 .playwright-mcp/

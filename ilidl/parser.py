@@ -62,13 +62,8 @@ class _ReceiptHTMLParser(HTMLParser):
             if tender:
                 self.tender_description = tender
 
-            if (
-                attr_dict.get("data-tax-type")
-                and "data-tax-base-amount" in attr_dict
-            ):
-                entry = {
-                    k: v for k, v in attrs if v is not None
-                }
+            if attr_dict.get("data-tax-type") and "data-tax-base-amount" in attr_dict:
+                entry = {k: v for k, v in attrs if v is not None}
                 self.vat_entries.append(entry)
 
     def handle_data(self, data: str) -> None:
@@ -93,9 +88,7 @@ class _ReceiptHTMLParser(HTMLParser):
             if match and self.articles:
                 amount = float(match.group(1))
                 last_art = self.articles[-1]
-                discounts: list[dict[str, object]] = last_art.setdefault(
-                    "_discounts", []
-                )
+                discounts: list[dict[str, object]] = last_art.setdefault("_discounts", [])
                 discounts.append(
                     {
                         "description": self._pending_discount_desc,
@@ -135,7 +128,7 @@ def parse_receipt_html(html: str) -> ParsedReceipt:
     parser.feed(html)
 
     if not parser.articles:
-        msg = "No items found in receipt HTML"
+        msg = "No items found in receipt HTML. This parser supports UK Lidl receipts only."
         raise ReceiptParseError(msg, html)
 
     seen_ids: set[str] = set()

@@ -1,12 +1,14 @@
 """Playwright-based OAuth2 PKCE authentication for Lidl Plus."""
 
 import base64
+import contextlib
 import getpass
 import hashlib
 import re
 import secrets
+from typing import Any
 
-import requests
+import httpx
 
 from ilidl.config import Config
 from ilidl.exceptions import AuthError
@@ -40,10 +42,10 @@ def _build_auth_url(challenge: str, country: str, language: str) -> str:
     return f"{AUTH_API}/connect/authorize?{params}"
 
 
-def _exchange_code(code: str, verifier: str) -> dict:
+def _exchange_code(code: str, verifier: str) -> dict[str, Any]:
     """Exchange authorization code for tokens."""
     secret = base64.b64encode(f"{CLIENT_ID}:secret".encode()).decode()
-    resp = requests.post(
+    resp = httpx.post(
         f"{AUTH_API}/connect/token",
         headers={
             "Authorization": f"Basic {secret}",
@@ -57,13 +59,15 @@ def _exchange_code(code: str, verifier: str) -> dict:
         },
         timeout=30,
     )
-    if resp.status_code != 200:
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
         msg = f"Token exchange failed: {resp.status_code} {resp.text}"
-        raise AuthError(msg)
+        raise AuthError(msg) from exc
     return resp.json()
 
 
-def _dbg(debug: bool, page, name: str, msg: str = ""):
+def _dbg(debug: bool, page: Any, name: str, msg: str = "") -> None:
     """Save a debug screenshot and optionally print a message."""
     if not debug:
         return
@@ -77,10 +81,7 @@ def login(config: Config, *, debug: bool = False) -> str:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:
-        msg = (
-            "Playwright is required for login. "
-            "Install with: uv pip install 'ilidl[auth]'"
-        )
+        msg = "Playwright is required for login. Install with: uv pip install 'ilidl[auth]'"
         raise AuthError(msg) from e
 
     verifier, challenge = _generate_pkce()
@@ -128,26 +129,20 @@ def login(config: Config, *, debug: bool = False) -> str:
         _dbg(debug, page, "01_welcome", f"url: {page.url}")
 
         # Click "Log in" on the welcome page
-        page.locator(
-            "button:has-text('Log in'), "
-            "a:has-text('Log in')"
-        ).first.click(timeout=5000)
+        page.locator("button:has-text('Log in'), a:has-text('Log in')").first.click(timeout=5000)
         page.wait_for_load_state("networkidle")
         _dbg(debug, page, "02_login_form", "on login form")
 
         # Switch to phone number login
-        page.locator(
-            "button:has-text('phone number'), "
-            "a:has-text('phone number')"
-        ).first.click(timeout=5000)
+        page.locator("button:has-text('phone number'), a:has-text('phone number')").first.click(
+            timeout=5000
+        )
         page.wait_for_load_state("networkidle")
         _dbg(debug, page, "03_phone_form", f"url: {page.url}")
 
         # Fill local phone number (country code is pre-selected)
         phone_field = page.locator(
-            "input[type='tel'], "
-            "input[name='PhoneNumber'], "
-            "input[name='phoneNumber']"
+            "input[type='tel'], input[name='PhoneNumber'], input[name='phoneNumber']"
         ).first
         phone_field.fill(phone)
 
@@ -157,33 +152,27 @@ def login(config: Config, *, debug: bool = False) -> str:
 
         # Submit and wait for navigation or page change
         login_url = page.url
-        page.locator(
-            "button:has-text('Log in'), "
-            "button[type='submit']"
-        ).first.click()
+        page.locator("button:has-text('Log in'), button[type='submit']").first.click()
 
         # Wait for URL to change or for an error/verification
         # element to appear
-        try:
+        with contextlib.suppress(TimeoutError):
             page.wait_for_function(
                 f"window.location.href !== '{login_url}' || "
                 "document.querySelector("
-                "  '[name=\"VerificationCode\"],"
+                '  \'[name="VerificationCode"],'
                 "  .alert-danger,"
                 "  .error-message'"
                 ")",
                 timeout=15000,
             )
-        except Exception:
-            pass
         page.wait_for_load_state("networkidle")
         _dbg(debug, page, "05_after_submit", f"url: {page.url}")
 
         # Check for error message
         if not code:
             error_el = page.locator(
-                ".alert-danger, .error-message, "
-                "[class*='error'], [class*='Error']"
+                ".alert-danger, .error-message, [class*='error'], [class*='Error']"
             )
             if error_el.first.is_visible(timeout=2000):
                 error_text = error_el.first.text_content()
@@ -195,16 +184,12 @@ def login(config: Config, *, debug: bool = False) -> str:
         # Check for verification code prompt
         if not code:
             verify_field = page.locator(
-                "[name='VerificationCode'], "
-                "input[name='code'], "
-                "input[inputmode='numeric']"
+                "[name='VerificationCode'], input[name='code'], input[inputmode='numeric']"
             )
             try:
                 if verify_field.first.is_visible(timeout=10000):
                     _dbg(debug, page, "06_verify_prompt")
-                    otp = input(
-                        "Enter verification code: "
-                    ).strip()
+                    otp = input("Enter verification code: ").strip()
                     verify_field.first.fill(otp)
                     page.locator(
                         "button[type='submit'], "
@@ -213,17 +198,10 @@ def login(config: Config, *, debug: bool = False) -> str:
                     ).first.click()
 
                     # Wait for redirect after verify
-                    try:
-                        page.wait_for_url(
-                            "**/callback*", timeout=15000
-                        )
-                    except Exception:
-                        pass
+                    with contextlib.suppress(TimeoutError):
+                        page.wait_for_url("**/callback*", timeout=15000)
                     page.wait_for_timeout(3000)
-                    _dbg(
-                        debug, page, "07_after_verify",
-                        f"url: {page.url}"
-                    )
+                    _dbg(debug, page, "07_after_verify", f"url: {page.url}")
             except Exception as exc:
                 if debug:
                     print(f"DEBUG verify error: {exc}")
