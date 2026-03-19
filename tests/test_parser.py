@@ -72,3 +72,14 @@ class TestParseError:
     def test_no_items_raises(self):
         with pytest.raises(ReceiptParseError):
             parse_receipt_html("<html><body><pre></pre></body></html>")
+
+    def test_missing_total_raises(self):
+        html = (
+            "<html><body><pre>"
+            '<span class="article" data-art-id="1" '
+            'data-unit-price="2.00" data-tax-type="A" '
+            'data-art-description="Widget">Widget 2.00</span>'
+            "</pre></body></html>"
+        )
+        with pytest.raises(ReceiptParseError, match="Could not find TOTAL"):
+            parse_receipt_html(html)
