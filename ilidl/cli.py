@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import click
-import requests
+import httpx
 
 from ilidl.client import LidlClient
 from ilidl.config import Config
@@ -190,7 +190,7 @@ def coupons_activate(coupon_id: str | None, activate_all: bool) -> None:
                 try:
                     client.activate_coupon(c.id)
                     click.echo(f"Activated: {c.title}")
-                except requests.HTTPError as e:
+                except httpx.HTTPStatusError as e:
                     click.echo(
                         f"Skipped: {c.title} ({e.response.status_code})",
                         err=True,

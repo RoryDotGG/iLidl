@@ -4,8 +4,8 @@ import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-import requests
 from click.testing import CliRunner
 
 from ilidl.cli import _json_serial, cli
@@ -323,7 +323,9 @@ class TestCouponsCommand:
         mock_client = MagicMock()
         mock_client.coupons.return_value = [coupon]
         error_resp = MagicMock(status_code=409)
-        mock_client.activate_coupon.side_effect = requests.HTTPError(
+        mock_client.activate_coupon.side_effect = httpx.HTTPStatusError(
+            "409",
+            request=MagicMock(),
             response=error_resp,
         )
         mock_get_client.return_value = mock_client

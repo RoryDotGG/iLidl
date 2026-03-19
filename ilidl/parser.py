@@ -128,10 +128,7 @@ def parse_receipt_html(html: str) -> ParsedReceipt:
     parser.feed(html)
 
     if not parser.articles:
-        msg = (
-            "No items found in receipt HTML. "
-            "This parser supports UK Lidl receipts only."
-        )
+        msg = "No items found in receipt HTML. This parser supports UK Lidl receipts only."
         raise ReceiptParseError(msg, html)
 
     seen_ids: set[str] = set()
