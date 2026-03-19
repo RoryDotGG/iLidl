@@ -2,10 +2,10 @@
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
+import httpx
 import pytest
-import requests
 
 from ilidl.client import LidlClient
 from ilidl.exceptions import AuthError, ILidlError
@@ -14,20 +14,34 @@ from ilidl.models import Receipt
 FIXTURE = Path(__file__).parent / "fixtures" / "receipt_gb_sample.json"
 
 
-def _mock_token_response(include_refresh=True):
-    data = {
-        "access_token": "test_access_token",
-        "expires_in": 1200,
-    }
+def _mock_response(status_code: int = 200, json_data: dict | None = None, text: str = ""):
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.text = text
+    resp.json.return_value = json_data or {}
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            f"{status_code}",
+            request=MagicMock(),
+            response=resp,
+        )
+    else:
+        resp.raise_for_status.return_value = None
+    return resp
+
+
+def _token_json(include_refresh: bool = True) -> dict:
+    data = {"access_token": "test_access_token", "expires_in": 1200}
     if include_refresh:
         data["refresh_token"] = "new_refresh_token"
-    return MagicMock(
-        status_code=200,
-        json=lambda: data,
-    )
+    return data
 
 
-def _mock_tickets_response(tickets=None, total_count=None, page_size=25):
+def _tickets_json(
+    tickets: list | None = None,
+    total_count: int | None = None,
+    page_size: int = 25,
+) -> dict:
     if tickets is None:
         tickets = [
             {
@@ -41,156 +55,145 @@ def _mock_tickets_response(tickets=None, total_count=None, page_size=25):
         ]
     if total_count is None:
         total_count = len(tickets)
-    return MagicMock(
-        status_code=200,
-        json=lambda: {
-            "page": 1,
-            "size": page_size,
-            "totalCount": total_count,
-            "tickets": tickets,
-        },
-    )
+    return {"page": 1, "size": page_size, "totalCount": total_count, "tickets": tickets}
 
 
-def _mock_ticket_detail_response():
-    data = json.loads(FIXTURE.read_text())
-    return MagicMock(status_code=200, json=lambda: data)
+def _detail_json() -> dict:
+    return json.loads(FIXTURE.read_text())
 
 
-def _make_client():
-    return LidlClient(
+def _make_client() -> LidlClient:
+    client = LidlClient(
         refresh_token="test_refresh",
         country="GB",
         language="en",
     )
+    client._http = MagicMock(spec=httpx.Client)
+    return client
+
+
+def _setup_token(client: LidlClient, include_refresh: bool = True) -> None:
+    """Configure mock to return a valid token on the next POST call."""
+    client._http.post.return_value = _mock_response(
+        json_data=_token_json(include_refresh),
+    )
 
 
 class TestTokenRenewal:
-    @patch("ilidl.client.requests.post")
-    def test_renews_token_on_first_call(self, mock_post):
-        mock_post.return_value = _mock_token_response()
+    def test_renews_token_on_first_call(self):
         client = _make_client()
+        _setup_token(client)
         headers = client._auth_headers()
         assert headers["Authorization"] == "Bearer test_access_token"
-        mock_post.assert_called_once()
+        client._http.post.assert_called_once()
 
-    @patch("ilidl.client.requests.post")
-    def test_reuses_token_when_not_expired(self, mock_post):
-        mock_post.return_value = _mock_token_response()
+    def test_reuses_token_when_not_expired(self):
         client = _make_client()
+        _setup_token(client)
         client._auth_headers()
         client._auth_headers()
-        assert mock_post.call_count == 1
+        assert client._http.post.call_count == 1
 
-    @patch("ilidl.client.requests.post")
-    def test_renewal_failure_raises_auth_error(self, mock_post):
-        mock_post.return_value = MagicMock(
+    def test_renewal_failure_raises_auth_error(self):
+        client = _make_client()
+        client._http.post.return_value = _mock_response(
             status_code=401,
             text="invalid_grant",
         )
-        client = _make_client()
         with pytest.raises(AuthError, match="Token renewal failed: 401"):
             client._auth_headers()
 
-    @patch("ilidl.client.requests.post")
-    def test_renewal_updates_refresh_token(self, mock_post):
-        mock_post.return_value = _mock_token_response(include_refresh=True)
+    def test_renewal_updates_refresh_token(self):
         client = _make_client()
+        _setup_token(client, include_refresh=True)
         client._auth_headers()
         assert client._refresh_token == "new_refresh_token"
 
-    @patch("ilidl.client.requests.post")
-    def test_renewal_keeps_old_refresh_token_when_not_returned(self, mock_post):
-        mock_post.return_value = _mock_token_response(include_refresh=False)
+    def test_renewal_keeps_old_refresh_token_when_not_returned(self):
         client = _make_client()
+        _setup_token(client, include_refresh=False)
         client._auth_headers()
         assert client._refresh_token == "test_refresh"
 
-    @patch("ilidl.client.requests.post")
-    def test_auth_headers_contain_required_fields(self, mock_post):
-        mock_post.return_value = _mock_token_response()
+    def test_auth_headers_contain_required_fields(self):
         client = _make_client()
+        _setup_token(client)
         headers = client._auth_headers()
         assert "Authorization" in headers
         assert headers["App-Version"] == "16.45.5"
         assert headers["Operating-System"] == "iOs"
         assert headers["Accept-Language"] == "en"
 
+    def test_custom_app_version(self):
+        client = LidlClient(
+            refresh_token="test",
+            country="GB",
+            language="en",
+            app_version="17.0.0",
+        )
+        client._http = MagicMock(spec=httpx.Client)
+        _setup_token(client)
+        headers = client._auth_headers()
+        assert headers["App-Version"] == "17.0.0"
+
 
 class TestGet:
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_get_passes_extra_headers(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = MagicMock(
-            status_code=200,
-            json=lambda: {"ok": True},
-        )
-        mock_get.return_value.raise_for_status = MagicMock()
+    def test_get_passes_extra_headers(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(json_data={"ok": True})
         client._get("https://example.com", extra_headers={"Country": "GB"})
-        call_headers = mock_get.call_args.kwargs["headers"]
+        call_headers = client._http.get.call_args.kwargs["headers"]
         assert call_headers["Country"] == "GB"
         assert "Authorization" in call_headers
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_get_raises_on_http_error(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = MagicMock(status_code=500)
-        mock_get.return_value.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
+    def test_get_raises_on_http_error(self):
         client = _make_client()
-        with pytest.raises(requests.HTTPError):
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(status_code=500)
+        with pytest.raises(httpx.HTTPStatusError):
             client._get("https://example.com")
 
 
 class TestReceipts:
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_latest_receipt(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.side_effect = [
-            _mock_tickets_response(),
-            _mock_ticket_detail_response(),
-        ]
+    def test_latest_receipt(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.side_effect = [
+            _mock_response(json_data=_tickets_json()),
+            _mock_response(json_data=_detail_json()),
+        ]
         receipt = client.latest_receipt()
         assert isinstance(receipt, Receipt)
         assert receipt.total == 12.38
         assert len(receipt.items) == 7
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_latest_receipt_no_receipts_raises(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = _mock_tickets_response(tickets=[], total_count=0)
+    def test_latest_receipt_no_receipts_raises(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(
+            json_data=_tickets_json(tickets=[], total_count=0),
+        )
         with pytest.raises(ILidlError, match="No receipts found"):
             client.latest_receipt()
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_receipt_by_id(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = _mock_ticket_detail_response()
+    def test_receipt_by_id(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(json_data=_detail_json())
         receipt = client.receipt("receipt123")
         assert receipt.id == "13001459742026031831079"
         assert receipt.store.name == "Llandaff"
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_receipts_single_page(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = _mock_tickets_response()
+    def test_receipts_single_page(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(json_data=_tickets_json())
         result = client.receipts()
         assert len(result) == 1
         assert result[0].id == "receipt123"
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_receipts_pagination(self, mock_post, mock_get):
+    def test_receipts_pagination(self):
         """Two pages: page 1 has 2 tickets, page 2 has 1 ticket."""
         ticket_a = {
             "id": "a",
@@ -201,47 +204,42 @@ class TestReceipts:
         }
         ticket_b = {**ticket_a, "id": "b"}
         ticket_c = {**ticket_a, "id": "c"}
-        page1 = MagicMock(
-            status_code=200,
-            json=lambda: {
+        page1 = _mock_response(
+            json_data={
                 "page": 1,
                 "size": 2,
                 "totalCount": 3,
                 "tickets": [ticket_a, ticket_b],
-            },
+            }
         )
-        page2 = MagicMock(
-            status_code=200,
-            json=lambda: {
+        page2 = _mock_response(
+            json_data={
                 "page": 2,
                 "size": 2,
                 "totalCount": 3,
                 "tickets": [ticket_c],
-            },
+            }
         )
-        mock_post.return_value = _mock_token_response()
-        mock_get.side_effect = [page1, page2]
         client = _make_client()
+        _setup_token(client)
+        client._http.get.side_effect = [page1, page2]
         result = client.receipts()
         assert len(result) == 3
         assert [r.id for r in result] == ["a", "b", "c"]
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_receipts_only_favourite(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        mock_get.return_value = _mock_tickets_response()
+    def test_receipts_only_favourite(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(json_data=_tickets_json())
         client.receipts(only_favourite=True)
-        url = mock_get.call_args_list[0].args[0]
+        url = client._http.get.call_args_list[0].args[0]
         assert "onlyFavorite=True" in url
 
 
 class TestCoupons:
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_coupons_parses_sections(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
+    def test_coupons_parses_sections(self):
+        client = _make_client()
+        _setup_token(client)
         coupon_data = {
             "sections": [
                 {
@@ -264,10 +262,7 @@ class TestCoupons:
                 }
             ]
         }
-        resp = MagicMock(status_code=200, json=lambda: coupon_data)
-        resp.raise_for_status = MagicMock()
-        mock_get.return_value = resp
-        client = _make_client()
+        client._http.get.return_value = _mock_response(json_data=coupon_data)
         coupons = client.coupons()
         assert len(coupons) == 1
         assert coupons[0].id == "c1"
@@ -276,57 +271,51 @@ class TestCoupons:
         assert coupons[0].image_url == "https://example.com/pizza.jpg"
         assert coupons[0].is_activated is True
 
-    @patch("ilidl.client.requests.get")
-    @patch("ilidl.client.requests.post")
-    def test_coupons_empty_sections(self, mock_post, mock_get):
-        mock_post.return_value = _mock_token_response()
-        resp = MagicMock(status_code=200, json=lambda: {"sections": []})
-        resp.raise_for_status = MagicMock()
-        mock_get.return_value = resp
+    def test_coupons_empty_sections(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.get.return_value = _mock_response(
+            json_data={"sections": []},
+        )
         assert client.coupons() == []
 
-    @patch("ilidl.client.requests.post")
-    def test_activate_coupon(self, mock_post):
-        token_resp = _mock_token_response()
-        activate_resp = MagicMock(status_code=200)
-        activate_resp.raise_for_status = MagicMock()
-        mock_post.side_effect = [token_resp, activate_resp]
+    def test_activate_coupon(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.post.side_effect = [
+            _mock_response(json_data=_token_json()),
+            _mock_response(),
+        ]
         client.activate_coupon("c1")
-        assert mock_post.call_count == 2
-        activate_call = mock_post.call_args_list[1]
+        assert client._http.post.call_count == 2
+        activate_call = client._http.post.call_args_list[1]
         assert "c1/activation" in activate_call.args[0]
         assert activate_call.kwargs["headers"]["Country"] == "GB"
 
-    @patch("ilidl.client.requests.post")
-    def test_activate_coupon_http_error(self, mock_post):
-        token_resp = _mock_token_response()
-        error_resp = MagicMock(status_code=409)
-        error_resp.raise_for_status.side_effect = requests.HTTPError("409 Conflict")
-        mock_post.side_effect = [token_resp, error_resp]
+    def test_activate_coupon_http_error(self):
         client = _make_client()
-        with pytest.raises(requests.HTTPError):
+        _setup_token(client)
+        client._http.post.side_effect = [
+            _mock_response(json_data=_token_json()),
+            _mock_response(status_code=409),
+        ]
+        with pytest.raises(httpx.HTTPStatusError):
             client.activate_coupon("c1")
 
-    @patch("ilidl.client.requests.delete")
-    @patch("ilidl.client.requests.post")
-    def test_deactivate_coupon(self, mock_post, mock_delete):
-        mock_post.return_value = _mock_token_response()
-        mock_delete.return_value = MagicMock(status_code=200)
-        mock_delete.return_value.raise_for_status = MagicMock()
+    def test_deactivate_coupon(self):
         client = _make_client()
+        _setup_token(client)
+        client._http.request.return_value = _mock_response()
         client.deactivate_coupon("c1")
-        assert "c1/activation" in mock_delete.call_args.args[0]
+        call_args = client._http.request.call_args
+        assert call_args.args[0] == "DELETE"
+        assert "c1/activation" in call_args.args[1]
 
-    @patch("ilidl.client.requests.delete")
-    @patch("ilidl.client.requests.post")
-    def test_deactivate_coupon_http_error(self, mock_post, mock_delete):
-        mock_post.return_value = _mock_token_response()
-        mock_delete.return_value = MagicMock(status_code=404)
-        mock_delete.return_value.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+    def test_deactivate_coupon_http_error(self):
         client = _make_client()
-        with pytest.raises(requests.HTTPError):
+        _setup_token(client)
+        client._http.request.return_value = _mock_response(status_code=404)
+        with pytest.raises(httpx.HTTPStatusError):
             client.deactivate_coupon("c1")
 
 
@@ -364,3 +353,16 @@ class TestTicketConversion:
         assert receipt.payment_method == "CARD"
         assert "A" in receipt.vat_breakdown
         assert "B" in receipt.vat_breakdown
+
+
+class TestClientLifecycle:
+    def test_context_manager(self):
+        client = _make_client()
+        with client:
+            pass
+        client._http.close.assert_called_once()
+
+    def test_close(self):
+        client = _make_client()
+        client.close()
+        client._http.close.assert_called_once()

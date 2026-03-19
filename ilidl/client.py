@@ -2,19 +2,41 @@
 
 import base64
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-import requests
+import httpx
 
 from ilidl.exceptions import AuthError, ILidlError
 from ilidl.models import Coupon, Receipt, Store
 from ilidl.parser import parse_receipt_html
 
-APP_VERSION = "16.45.5"
+DEFAULT_APP_VERSION = "16.45.5"
 AUTH_API = "https://accounts.lidl.com"
 TICKETS_API = "https://tickets.lidlplus.com/api"
 COUPONS_API = "https://coupons.lidlplus.com/app/api"
 CLIENT_ID = "LidlPlusNativeClient"
-TIMEOUT = 30
+
+
+class _RetryTransport(httpx.BaseTransport):
+    """Retries requests on connection errors."""
+
+    def __init__(self, retries: int = 3) -> None:
+        self._transport = httpx.HTTPTransport()
+        self._retries = retries
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        last_exc: Exception | None = None
+        for attempt in range(self._retries):
+            try:
+                return self._transport.handle_request(request)
+            except httpx.ConnectError as exc:
+                last_exc = exc
+                if attempt == self._retries - 1:
+                    raise
+        raise last_exc  # type: ignore[misc]
+
+    def close(self) -> None:
+        self._transport.close()
 
 
 class LidlClient:
@@ -28,20 +50,36 @@ class LidlClient:
         refresh_token: str,
         country: str,
         language: str,
+        app_version: str = DEFAULT_APP_VERSION,
     ) -> None:
         self._refresh_token = refresh_token
         self._country = country.upper()
         self._language = language.lower()
+        self._app_version = app_version
         self._access_token: str = ""
         self._token_expires: datetime = datetime.min.replace(
             tzinfo=UTC,
         )
+        self._http = httpx.Client(
+            transport=_RetryTransport(retries=3),
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        self._http.close()
+
+    def __enter__(self) -> "LidlClient":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     def _renew_token(self) -> None:
         secret = base64.b64encode(
             f"{CLIENT_ID}:secret".encode(),
         ).decode()
-        resp = requests.post(
+        resp = self._http.post(
             f"{AUTH_API}/connect/token",
             headers={
                 "Authorization": f"Basic {secret}",
@@ -51,7 +89,6 @@ class LidlClient:
                 "refresh_token": self._refresh_token,
                 "grant_type": "refresh_token",
             },
-            timeout=TIMEOUT,
         )
         if resp.status_code != 200:
             msg = f"Token renewal failed: {resp.status_code} {resp.text}"
@@ -70,7 +107,7 @@ class LidlClient:
             self._renew_token()
         return {
             "Authorization": f"Bearer {self._access_token}",
-            "App-Version": APP_VERSION,
+            "App-Version": self._app_version,
             "Operating-System": "iOs",
             "App": "com.lidl.eci.lidl.plus",
             "Accept-Language": self._language,
@@ -80,15 +117,11 @@ class LidlClient:
         self,
         url: str,
         extra_headers: dict[str, str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         headers = self._auth_headers()
         if extra_headers:
             headers.update(extra_headers)
-        resp = requests.get(
-            url,
-            headers=headers,
-            timeout=TIMEOUT,
-        )
+        resp = self._http.get(url, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -166,11 +199,7 @@ class LidlClient:
         url = f"{COUPONS_API}/v1/promotions/{coupon_id}/activation"
         headers = self._auth_headers()
         headers.update(self._coupon_headers())
-        resp = requests.post(
-            url,
-            headers=headers,
-            timeout=TIMEOUT,
-        )
+        resp = self._http.post(url, headers=headers)
         resp.raise_for_status()
 
     def deactivate_coupon(self, coupon_id: str) -> None:
@@ -178,15 +207,11 @@ class LidlClient:
         url = f"{COUPONS_API}/v2/promotions/{coupon_id}/activation"
         headers = self._auth_headers()
         headers.update(self._coupon_headers())
-        resp = requests.delete(
-            url,
-            headers=headers,
-            timeout=TIMEOUT,
-        )
+        resp = self._http.request("DELETE", url, headers=headers)
         resp.raise_for_status()
 
     @staticmethod
-    def _ticket_summary_to_receipt(ticket: dict) -> Receipt:
+    def _ticket_summary_to_receipt(ticket: dict[str, Any]) -> Receipt:
         currency = ticket.get("currency", {})
         return Receipt(
             id=ticket["id"],
@@ -204,7 +229,7 @@ class LidlClient:
         )
 
     @staticmethod
-    def _ticket_detail_to_receipt(data: dict) -> Receipt:
+    def _ticket_detail_to_receipt(data: dict[str, Any]) -> Receipt:
         store_data = data.get("store", {})
         store = Store(
             id=store_data.get("id", ""),
