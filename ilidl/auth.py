@@ -6,8 +6,9 @@ import getpass
 import hashlib
 import re
 import secrets
+from typing import Any
 
-import requests
+import httpx
 
 from ilidl.config import Config
 from ilidl.exceptions import AuthError
@@ -41,10 +42,10 @@ def _build_auth_url(challenge: str, country: str, language: str) -> str:
     return f"{AUTH_API}/connect/authorize?{params}"
 
 
-def _exchange_code(code: str, verifier: str) -> dict:
+def _exchange_code(code: str, verifier: str) -> dict[str, Any]:
     """Exchange authorization code for tokens."""
     secret = base64.b64encode(f"{CLIENT_ID}:secret".encode()).decode()
-    resp = requests.post(
+    resp = httpx.post(
         f"{AUTH_API}/connect/token",
         headers={
             "Authorization": f"Basic {secret}",
@@ -58,13 +59,15 @@ def _exchange_code(code: str, verifier: str) -> dict:
         },
         timeout=30,
     )
-    if resp.status_code != 200:
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
         msg = f"Token exchange failed: {resp.status_code} {resp.text}"
-        raise AuthError(msg)
+        raise AuthError(msg) from exc
     return resp.json()
 
 
-def _dbg(debug: bool, page, name: str, msg: str = ""):
+def _dbg(debug: bool, page: Any, name: str, msg: str = "") -> None:
     """Save a debug screenshot and optionally print a message."""
     if not debug:
         return

@@ -17,11 +17,13 @@ def _get_client() -> LidlClient:
     if not config.refresh_token:
         click.echo("Not logged in. Run: ilidl login", err=True)
         raise SystemExit(1)
-    return LidlClient(
+    client = LidlClient(
         refresh_token=config.refresh_token,
         country=config.country,
         language=config.language,
     )
+    click.get_current_context().call_on_close(client.close)
+    return client
 
 
 def _json_serial(obj: Any) -> str:

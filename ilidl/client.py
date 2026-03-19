@@ -25,15 +25,15 @@ class _RetryTransport(httpx.BaseTransport):
         self._retries = retries
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        last_exc: Exception | None = None
-        for attempt in range(self._retries):
+        last_exc: httpx.ConnectError | None = None
+        for _ in range(self._retries):
             try:
                 return self._transport.handle_request(request)
             except httpx.ConnectError as exc:
                 last_exc = exc
-                if attempt == self._retries - 1:
-                    raise
-        raise last_exc  # type: ignore[misc]
+        if last_exc is not None:
+            raise last_exc
+        return self._transport.handle_request(request)
 
     def close(self) -> None:
         self._transport.close()
@@ -90,9 +90,11 @@ class LidlClient:
                 "grant_type": "refresh_token",
             },
         )
-        if resp.status_code != 200:
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
             msg = f"Token renewal failed: {resp.status_code} {resp.text}"
-            raise AuthError(msg)
+            raise AuthError(msg) from exc
         data = resp.json()
         self._access_token = data["access_token"]
         self._token_expires = datetime.now(
@@ -207,7 +209,7 @@ class LidlClient:
         url = f"{COUPONS_API}/v2/promotions/{coupon_id}/activation"
         headers = self._auth_headers()
         headers.update(self._coupon_headers())
-        resp = self._http.request("DELETE", url, headers=headers)
+        resp = self._http.delete(url, headers=headers)
         resp.raise_for_status()
 
     @staticmethod

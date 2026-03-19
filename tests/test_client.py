@@ -305,16 +305,15 @@ class TestCoupons:
     def test_deactivate_coupon(self):
         client = _make_client()
         _setup_token(client)
-        client._http.request.return_value = _mock_response()
+        client._http.delete.return_value = _mock_response()
         client.deactivate_coupon("c1")
-        call_args = client._http.request.call_args
-        assert call_args.args[0] == "DELETE"
-        assert "c1/activation" in call_args.args[1]
+        url = client._http.delete.call_args.args[0]
+        assert "c1/activation" in url
 
     def test_deactivate_coupon_http_error(self):
         client = _make_client()
         _setup_token(client)
-        client._http.request.return_value = _mock_response(status_code=404)
+        client._http.delete.return_value = _mock_response(status_code=404)
         with pytest.raises(httpx.HTTPStatusError):
             client.deactivate_coupon("c1")
 
