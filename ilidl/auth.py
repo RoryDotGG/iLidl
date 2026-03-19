@@ -63,18 +63,30 @@ def _exchange_code(code: str, verifier: str) -> dict:
     return resp.json()
 
 
-def login(config: Config) -> str:
-    """Run interactive login flow. Returns refresh token."""
+def _dbg(debug: bool, page, name: str, msg: str = ""):
+    """Save a debug screenshot and optionally print a message."""
+    if not debug:
+        return
+    page.screenshot(path=f"/tmp/ilidl_{name}.png")
+    if msg:
+        print(f"DEBUG {msg}")
+
+
+def login(config: Config, *, debug: bool = False) -> str:
+    """Run interactive login via phone number. Returns refresh token."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:
-        msg = "Playwright is required for login. Install with: uv pip install 'ilidl[auth]'"
+        msg = (
+            "Playwright is required for login. "
+            "Install with: uv pip install 'ilidl[auth]'"
+        )
         raise AuthError(msg) from e
 
     verifier, challenge = _generate_pkce()
     url = _build_auth_url(challenge, config.country, config.language)
 
-    email = input("Email: ").strip()
+    phone = input("Phone number (local, e.g. 7400123456): ").strip()
     password = getpass.getpass("Password: ")
 
     with sync_playwright() as p:
@@ -83,48 +95,139 @@ def login(config: Config) -> str:
 
         code: str = ""
 
-        def handle_route(route):
+        def handle_request(request):
             nonlocal code
-            req_url = route.request.url
-            if "callback?code=" in req_url:
-                match = re.search(r"code=([0-9A-F]+)", req_url)
+            req_url = request.url
+            if debug:
+                print(f"DEBUG request: {req_url[:120]}")
+            if req_url.startswith("com.lidlplus.app://"):
+                match = re.search(r"code=([^&]+)", req_url)
                 if match:
                     code = match.group(1)
-                route.abort()
-            else:
-                route.continue_()
+                    if debug:
+                        print(f"DEBUG got code: {code}")
 
-        page.route("**/callback*", handle_route)
+        def handle_response(response):
+            nonlocal code
+            # Check for 302 redirects to the app callback
+            if code:
+                return
+            location = response.headers.get("location", "")
+            if location.startswith("com.lidlplus.app://"):
+                match = re.search(r"code=([^&]+)", location)
+                if match:
+                    code = match.group(1)
+                    if debug:
+                        print(f"DEBUG got code from redirect: {code}")
+
+        page.on("request", handle_request)
+        page.on("response", handle_response)
+
         page.goto(url)
         page.wait_for_load_state("networkidle")
+        _dbg(debug, page, "01_welcome", f"url: {page.url}")
 
-        # Click "Log in" button on welcome page
-        login_btn = page.locator("button:has-text('Log in')").first
-        login_btn.click()
+        # Click "Log in" on the welcome page
+        page.locator(
+            "button:has-text('Log in'), "
+            "a:has-text('Log in')"
+        ).first.click(timeout=5000)
         page.wait_for_load_state("networkidle")
+        _dbg(debug, page, "02_login_form", "on login form")
 
-        # Fill email
-        page.locator("#input-email").fill(email)
+        # Switch to phone number login
+        page.locator(
+            "button:has-text('phone number'), "
+            "a:has-text('phone number')"
+        ).first.click(timeout=5000)
+        page.wait_for_load_state("networkidle")
+        _dbg(debug, page, "03_phone_form", f"url: {page.url}")
+
+        # Fill local phone number (country code is pre-selected)
+        phone_field = page.locator(
+            "input[type='tel'], "
+            "input[name='PhoneNumber'], "
+            "input[name='phoneNumber']"
+        ).first
+        phone_field.fill(phone)
+
         # Fill password
-        page.locator("input[id='Password'][type='password']").fill(password)
+        page.locator("input[type='password']").first.fill(password)
+        _dbg(debug, page, "04_filled")
 
-        # Submit
-        page.locator("button:has-text('Log in')").first.click()
+        # Submit and wait for navigation or page change
+        login_url = page.url
+        page.locator(
+            "button:has-text('Log in'), "
+            "button[type='submit']"
+        ).first.click()
 
-        # Wait for 2FA or redirect
-        page.wait_for_timeout(3000)
+        # Wait for URL to change or for an error/verification
+        # element to appear
+        try:
+            page.wait_for_function(
+                f"window.location.href !== '{login_url}' || "
+                "document.querySelector("
+                "  '[name=\"VerificationCode\"],"
+                "  .alert-danger,"
+                "  .error-message'"
+                ")",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+        page.wait_for_load_state("networkidle")
+        _dbg(debug, page, "05_after_submit", f"url: {page.url}")
 
-        # Check for 2FA
+        # Check for error message
         if not code:
+            error_el = page.locator(
+                ".alert-danger, .error-message, "
+                "[class*='error'], [class*='Error']"
+            )
+            if error_el.first.is_visible(timeout=2000):
+                error_text = error_el.first.text_content()
+                _dbg(debug, page, "05b_error")
+                browser.close()
+                msg = f"Login failed: {error_text}"
+                raise AuthError(msg)
+
+        # Check for verification code prompt
+        if not code:
+            verify_field = page.locator(
+                "[name='VerificationCode'], "
+                "input[name='code'], "
+                "input[inputmode='numeric']"
+            )
             try:
-                verify_field = page.locator("[name='VerificationCode']")
-                if verify_field.is_visible(timeout=5000):
-                    verify_code = input("Enter verification code: ").strip()
-                    verify_field.fill(verify_code)
-                    page.locator("button:has-text('Submit'), .role_next").first.click()
+                if verify_field.first.is_visible(timeout=10000):
+                    _dbg(debug, page, "06_verify_prompt")
+                    otp = input(
+                        "Enter verification code: "
+                    ).strip()
+                    verify_field.first.fill(otp)
+                    page.locator(
+                        "button[type='submit'], "
+                        "button:has-text('Submit'), "
+                        "button:has-text('Verify')"
+                    ).first.click()
+
+                    # Wait for redirect after verify
+                    try:
+                        page.wait_for_url(
+                            "**/callback*", timeout=15000
+                        )
+                    except Exception:
+                        pass
                     page.wait_for_timeout(3000)
-            except Exception:
-                pass
+                    _dbg(
+                        debug, page, "07_after_verify",
+                        f"url: {page.url}"
+                    )
+            except Exception as exc:
+                if debug:
+                    print(f"DEBUG verify error: {exc}")
+                _dbg(debug, page, "08_error")
 
         browser.close()
 

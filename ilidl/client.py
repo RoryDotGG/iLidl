@@ -12,7 +12,7 @@ from ilidl.parser import parse_receipt_html
 APP_VERSION = "16.45.5"
 AUTH_API = "https://accounts.lidl.com"
 TICKETS_API = "https://tickets.lidlplus.com/api"
-COUPONS_API = "https://coupons.lidlplus.com/api"
+COUPONS_API = "https://coupons.lidlplus.com/app/api"
 CLIENT_ID = "LidlPlusNativeClient"
 TIMEOUT = 30
 
@@ -78,10 +78,17 @@ class LidlClient:
             "Accept-Language": self._language,
         }
 
-    def _get(self, url: str) -> dict:
+    def _get(
+        self,
+        url: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict:
+        headers = self._auth_headers()
+        if extra_headers:
+            headers.update(extra_headers)
         resp = requests.get(
             url,
-            headers=self._auth_headers(),
+            headers=headers,
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
@@ -127,28 +134,34 @@ class LidlClient:
             raise ILidlError(msg)
         return self.receipt(tickets[0]["id"])
 
+    def _coupon_headers(self) -> dict[str, str]:
+        return {"Country": self._country}
+
     def coupons(self) -> list[Coupon]:
         """Fetch all available coupons."""
-        url = f"{COUPONS_API}/v2/{self._country}"
-        data = self._get(url)
+        url = f"{COUPONS_API}/v2/promotionsList"
+        data = self._get(url, self._coupon_headers())
         result: list[Coupon] = []
         for section in data.get("sections", []):
-            for c in section.get("coupons", []):
+            for p in section.get("promotions", []):
+                validity = p.get("validity", {})
+                discount = p.get("discount", {})
+                desc = discount.get("description", "")
+                if discount.get("title"):
+                    desc = f"{discount['title']} {desc}".strip()
                 result.append(
                     Coupon(
-                        id=c["id"],
-                        title=c.get("title", ""),
-                        description=c.get(
-                            "offerDescriptionShort", "",
-                        ),
-                        image_url=c.get("image"),
+                        id=p["id"],
+                        title=p.get("title", ""),
+                        description=desc,
+                        image_url=p.get("image"),
                         start_date=datetime.fromisoformat(
-                            c["startValidityDate"],
+                            validity["start"],
                         ),
                         end_date=datetime.fromisoformat(
-                            c["endValidityDate"],
+                            validity["end"],
                         ),
-                        is_activated=c.get("isActivated", False),
+                        is_activated=p.get("isActivated", False),
                     )
                 )
         return result
@@ -156,12 +169,14 @@ class LidlClient:
     def activate_coupon(self, coupon_id: str) -> None:
         """Activate a coupon by ID."""
         url = (
-            f"{COUPONS_API}/v1/{self._country}"
+            f"{COUPONS_API}/v1/promotions"
             f"/{coupon_id}/activation"
         )
+        headers = self._auth_headers()
+        headers.update(self._coupon_headers())
         resp = requests.post(
             url,
-            headers=self._auth_headers(),
+            headers=headers,
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
@@ -169,12 +184,14 @@ class LidlClient:
     def deactivate_coupon(self, coupon_id: str) -> None:
         """Deactivate a coupon by ID."""
         url = (
-            f"{COUPONS_API}/v1/{self._country}"
+            f"{COUPONS_API}/v2/promotions"
             f"/{coupon_id}/activation"
         )
+        headers = self._auth_headers()
+        headers.update(self._coupon_headers())
         resp = requests.delete(
             url,
-            headers=self._auth_headers(),
+            headers=headers,
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
