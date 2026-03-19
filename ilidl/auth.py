@@ -76,7 +76,12 @@ def _dbg(debug: bool, page: Any, name: str, msg: str = "") -> None:
         print(f"DEBUG {msg}")
 
 
-def login(config: Config, *, debug: bool = False) -> str:
+def login(
+    config: Config,
+    *,
+    debug: bool = False,
+    headless: bool = False,
+) -> str:
     """Run interactive login via phone number. Returns refresh token."""
     try:
         from playwright._impl._errors import TimeoutError as PwTimeout
@@ -97,7 +102,7 @@ def login(config: Config, *, debug: bool = False) -> str:
     password = getpass.getpass("Password: ")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         page = browser.new_page()
 
         code: str = ""
@@ -237,7 +242,15 @@ def login(config: Config, *, debug: bool = False) -> str:
         browser.close()
 
     if not code:
-        msg = "Login failed: could not extract authorization code"
+        hint = (
+            " Try without --headless."
+            if headless
+            else ""
+        )
+        msg = (
+            "Login failed: could not extract "
+            f"authorization code.{hint}"
+        )
         raise AuthError(msg)
 
     tokens = _exchange_code(code, verifier)

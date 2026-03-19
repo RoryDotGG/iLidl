@@ -40,7 +40,12 @@ def cli() -> None:
 
 @cli.command()
 @click.option("--debug", is_flag=True, help="Save debug screenshots")
-def login(*, debug: bool) -> None:
+@click.option(
+    "--headless",
+    is_flag=True,
+    help="Run browser without a visible window",
+)
+def login(*, debug: bool, headless: bool) -> None:
     """Authenticate with Lidl Plus."""
     from ilidl.auth import login as do_login
 
@@ -51,7 +56,7 @@ def login(*, debug: bool) -> None:
     config.country = country
     config.save()
 
-    do_login(config, debug=debug)
+    do_login(config, debug=debug, headless=headless)
     click.echo(f"Logged in. Token saved to {config.path}")
 
 
