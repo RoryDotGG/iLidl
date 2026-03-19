@@ -21,7 +21,7 @@ playwright install chromium
 ilidl login
 ```
 
-Launches a headless browser to complete the Lidl Plus OAuth flow. You'll be prompted for your email and password. A refresh token is saved to `~/.config/ilidl/config.toml` for future use.
+Launches a headless browser to complete the Lidl Plus OAuth flow. You'll be prompted for your phone number and a verification code. A refresh token is saved to `~/.config/ilidl/config.toml` for future use.
 
 ## CLI Usage
 
