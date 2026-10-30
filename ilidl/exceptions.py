@@ -6,7 +6,16 @@ class ILidlError(Exception):
 
 
 class AuthError(ILidlError):
-    """Authentication failed."""
+    """The Lidl web session is missing, unreadable or expired."""
+
+
+class CouponError(ILidlError):
+    """Lidl refused a coupon change (HTTP 412), e.g. not started yet or already active."""
+
+    def __init__(self, coupon_id: str, reason: str) -> None:
+        super().__init__(f"Coupon {coupon_id}: {reason}")
+        self.coupon_id = coupon_id
+        self.reason = reason
 
 
 class ReceiptParseError(ILidlError):

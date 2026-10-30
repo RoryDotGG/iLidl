@@ -1,7 +1,7 @@
 [project]
 name = "ilidl"
 dynamic = ["version"]
-description = "Unofficial Lidl Plus API client"
+description = "Unofficial Lidl UK receipts and coupons client"
 readme = "README.md"
 license = "MIT"
 keywords = ["lidl", "lidl-plus", "receipts", "coupons", "api-client"]
@@ -19,13 +19,14 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "httpx",
+    "browser-cookie3",
     "click",
+    "httpx",
     "tomli_w",
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
-auth = ["playwright"]
 dev = [
     "pytest",
     "ruff",

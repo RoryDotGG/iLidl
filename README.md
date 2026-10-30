@@ -1,6 +1,7 @@
 # iLidl
 
-Unofficial Python client and CLI for the Lidl Plus API. Fetch receipts, parse item details, and manage coupons.
+Unofficial Python client and CLI for Lidl UK receipts and coupons. It uses the same API as the
+lidl.co.uk website, authenticated by your logged-in browser session.
 
 ## Installation
 
@@ -9,75 +10,108 @@ pip install ilidl
 
 # Or with uv
 uv add ilidl
-
-# With auth support (requires Playwright for login)
-pip install "ilidl[auth]"
-playwright install chromium
 ```
 
 ## Authentication
 
+1. Log in at [lidl.co.uk](https://www.lidl.co.uk) in your browser.
+2. Tell iLidl which browser to read the session from:
+
 ```bash
-ilidl login
+ilidl login --browser brave
 ```
 
-Opens a browser window to complete the Lidl Plus OAuth flow. You'll be prompted for your phone number and password, then a verification code. A refresh token is saved to `~/.config/ilidl/config.toml` for future use.
+This checks the session works and saves the browser name to `~/.config/ilidl/config.toml`.
+Cookies are read from the browser on every run, so iLidl picks up the browser's refreshed session.
+On macOS the first run asks for Keychain access to the browser's "Safe Storage" key. If it fails
+with "Unable to read database file", macOS is blocking your terminal app from reading the
+browser's data: add the terminal app under System Settings > Privacy & Security > Full Disk
+Access, then restart it.
 
-A visible browser is required because Lidl's login uses reCAPTCHA Enterprise, which blocks headless browsers.
+Supported browsers: `arc`, `brave`, `chrome`, `chromium`, `edge`, `firefox`, `librewolf`, `opera`,
+`opera_gx`, `safari`, `vivaldi` (via [browser-cookie3](https://github.com/borisbabic/browser_cookie3)).
 
-## CLI Usage
+If the cookie store cannot be read, copy the cookies from DevTools instead. Open
+[your receipts](https://www.lidl.co.uk/mre/), then in DevTools > Network pick a request to
+`www.lidl.co.uk/mre/api/...` and copy its `Cookie` request header. `document.cookie` will not
+work because the session cookie is HttpOnly.
 
 ```bash
-# Receipts
-ilidl receipt latest              # Most recent receipt
-ilidl receipt latest --json       # As JSON
-ilidl receipt <id>                # Specific receipt
-ilidl receipts                    # List all receipts
-ilidl receipts --from 2026-03-01  # Filter by date
-ilidl receipts --to 2026-03-18
+export LIDL_COOKIE='authToken=...; ldi-session-info=...'
+```
+
+The session token (`authToken`) lasts 30 minutes. When it has expired, iLidl renews it the way the
+website does, using your accounts.lidl.com login from the same browser. If that login has expired
+too, commands fail with "Lidl session expired": log in at
+[lidl.co.uk/mre](https://www.lidl.co.uk/mre/) in the browser and retry. A `LIDL_COOKIE` session
+cannot be renewed, so it stops working after 30 minutes.
+
+### Troubleshooting
+
+`ilidl doctor` runs through the setup as a checklist and says how to fix each problem: which
+browser it reads, whether the cookies can be read, whether you are logged in, when the session
+token expires, whether it can be renewed, and whether receipts and coupons load. It never prints
+cookie values.
+
+```text
+  ✓ Cookie source            brave browser
+  ✓ Read cookies             15 lidl.co.uk, 7 accounts.lidl.com
+  ✓ Logged in to lidl.co.uk  authToken cookie found
+  ✓ Session token            Expired at 12:54, iLidl will renew it
+  ✓ Renewal login            accounts.lidl.com cookies found
+  ✓ Lidl session             Renewed and signed in
+  ✓ Receipts                 Latest 29 Oct 2026, £12.17 at Llandaff
+  ✓ Coupons                  17 available, 16 active
+```
+
+Use `ilidl doctor --browser chrome` to check a browser before running `login`.
+
+## CLI usage
+
+```bash
+# Receipts (newest first)
+ilidl receipts                      # all receipts
+ilidl receipts --limit 10
+ilidl receipts --from 2026-10-01 --to 2026-10-31
+ilidl receipt latest                # most recent receipt with line items
+ilidl receipt <id>
 
 # Coupons
-ilidl coupons list                # List available coupons
-ilidl coupons activate <id>       # Activate a coupon
-ilidl coupons activate --all      # Activate all coupons
-ilidl coupons deactivate <id>     # Deactivate a coupon
+ilidl coupons list
+ilidl coupons activate <id> [<id>...]
+ilidl coupons activate --all        # every inactive coupon that can be activated now
+ilidl coupons deactivate <id> [<id>...]
 ```
 
-All commands support `--json` for machine-readable output.
+`receipts`, `receipt` and `coupons list` support `--json`.
 
-## Library Usage
+`coupons activate --all` re-lists coupons first. Time-slot coupons, such as the bakery 20% coupon,
+get a new ID for each slot, and coupons that have not started yet are skipped.
+
+## Library usage
 
 ```python
 from ilidl import LidlClient
+from ilidl.auth import load_cookies
 
-client = LidlClient(refresh_token="...", country="GB", language="en")
+with LidlClient(load_cookies("brave")) as client:
+    receipt = client.latest_receipt()
+    for item in receipt.items:
+        print(item.name, item.quantity, item.price)
+        for discount in item.discounts:
+            print("  ", discount.description, -discount.amount)
 
-# Get latest receipt with parsed items
-receipt = client.latest_receipt()
-for item in receipt.items:
-    print(f"{item.name}: {item.price}")
-
-# List coupons
-for coupon in client.coupons():
-    print(f"{coupon.title} (active: {coupon.is_activated})")
+    for coupon in client.coupons():
+        if not coupon.is_activated:
+            client.activate_coupon(coupon.id)  # raises CouponError if Lidl refuses
 ```
 
-## Configuration
-
-Stored at `~/.config/ilidl/config.toml`:
-
-```toml
-[auth]
-refresh_token = "..."
-
-[account]
-language = "en"
-country = "GB"
-```
+Money values are `Decimal`. `client.receipts()` yields receipt summaries (no line items) and fetches
+pages lazily; `client.receipt(id)` fetches the line items.
 
 ## Notes
 
-- UK receipts are returned as HTML by the API and parsed into structured items using `data-*` attributes.
-- The `App-Version` header must be a realistic value (currently `16.45.5`). The API rejects fake versions.
-- API v2 is used for receipt lists, v3 for receipt detail.
-- This project replaces the upstream `lidl-plus` library which is broken on modern Python.
+- Only Lidl UK (`www.lidl.co.uk`) is supported.
+- Line items come from the receipt's printed HTML, which tags each line with `data-*` attributes.
+  See [docs/lidl-web-api.md](docs/lidl-web-api.md) for the endpoints and markup.
+- The API is undocumented and may change without notice.

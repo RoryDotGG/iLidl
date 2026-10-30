@@ -1,367 +1,240 @@
-"""Tests for ilidl API client."""
+"""Tests for ilidl API client, with lidl.co.uk replaced by an httpx.MockTransport."""
 
-import json
+from collections.abc import Callable
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
-from ilidl.client import LidlClient
-from ilidl.exceptions import AuthError, ILidlError
-from ilidl.models import Receipt
+from ilidl.client import LONDON, LidlClient
+from ilidl.exceptions import AuthError, CouponError
 
-FIXTURE = Path(__file__).parent / "fixtures" / "receipt_gb_sample.json"
+HTML = (Path(__file__).parent / "fixtures" / "receipt_gb.html").read_text()
+ACTIVATION = "/prm/api/v1/GB/promotions/c1/activation"
 
 
-def _mock_response(status_code: int = 200, json_data: dict | None = None, text: str = ""):
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = status_code
-    resp.text = text
-    resp.json.return_value = json_data or {}
-    if status_code >= 400:
-        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            f"{status_code}",
-            request=MagicMock(),
-            response=resp,
+def _ticket(n: int) -> dict:
+    return {
+        "id": f"t{n}",
+        "date": "2026-10-29T13:13:36+00:00",
+        "totalAmount": 12.17,
+        "articlesCount": 5,
+        "store": "Testville",
+        "isHtml": True,
+    }
+
+
+def _detail() -> dict:
+    return {
+        "ticket": {
+            "id": "t1",
+            "date": "2026-10-29T13:13:36",
+            "totalAmount": 0,
+            "store": {
+                "id": None,
+                "name": "Testville",
+                "address": "1 High Street",
+                "postalCode": "AB1 2CD",
+                "locality": "Testford",
+            },
+            "htmlPrintedReceipt": HTML,
+        },
+        "coupons": [{"title": "15% off", "description": "15% off rice"}],
+        "collectingModel": {"points": 13},
+    }
+
+
+def _promotion(**overrides) -> dict:
+    p = {
+        "id": "c1",
+        "offer": "£5",
+        "title": "off",
+        "description": "£5 off when you spend £40",
+        "image": {"url": "https://example.test/c1.png"},
+        "isActivated": False,
+        "isProcessing": False,
+        "locked": False,
+        "startValidityDate": "2026-10-26T06:32:38.02Z",
+        "endValidityDate": "2026-11-01T23:59:59Z",
+    }
+    return {**p, **overrides}
+
+
+def _client(handler: Callable[[httpx.Request], httpx.Response]) -> LidlClient:
+    return LidlClient({"authToken": "x"}, transport=httpx.MockTransport(handler))
+
+
+def _write_routes(requests: list[httpx.Request], activation: httpx.Response):
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/mla/api/v1/token":
+            return httpx.Response(200, json={"token": "jwt", "source": "3"})
+        if request.url.path == "/prm/antiforgerytoken":
+            return httpx.Response(200, headers={"set-cookie": "XSRF-TOKEN=csrf; path=/"})
+        return activation
+
+    return handler
+
+
+def test_receipts_pages_until_total_count():
+    pages = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        items = [_ticket(n) for n in range(10)] if page == 1 else [_ticket(10)]
+        return httpx.Response(
+            200, json={"items": items, "page": page, "size": 10, "totalCount": 11}
         )
-    else:
-        resp.raise_for_status.return_value = None
-    return resp
+
+    receipts = list(_client(handler).receipts())
+    assert pages == [1, 2]
+    assert len(receipts) == 11
+    assert receipts[0].total == Decimal("12.17")
+    assert receipts[0].store.name == "Testville"
+    assert receipts[0].date == datetime(2026, 10, 29, 13, 13, 36, tzinfo=LONDON)
 
 
-def _token_json(include_refresh: bool = True) -> dict:
-    data = {"access_token": "test_access_token", "expires_in": 1200}
-    if include_refresh:
-        data["refresh_token"] = "new_refresh_token"
-    return data
+def test_receipt_detail_uses_printed_total():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/mre/api/v1/tickets/t1"
+        assert request.url.params["languageCode"] == "en-GB"
+        return httpx.Response(200, json=_detail())
+
+    receipt = _client(handler).receipt("t1")
+    assert receipt.total == Decimal("4.00")
+    assert len(receipt.items) == 4
+    assert receipt.store.locality == "Testford"
+    assert receipt.coupons_used == ["15% off"]
+    assert receipt.points == 13
+    assert receipt.date == datetime(2026, 10, 29, 13, 13, 36, tzinfo=LONDON)
 
 
-def _tickets_json(
-    tickets: list | None = None,
-    total_count: int | None = None,
-    page_size: int = 25,
-) -> dict:
-    if tickets is None:
-        tickets = [
-            {
-                "id": "receipt123",
-                "date": "2026-03-18T19:26:50+00:00",
-                "totalAmount": 12.38,
-                "currency": {"code": "GBP", "symbol": "\u00a3"},
-                "storeCode": "GB1459",
-                "articlesCount": 7,
-            }
-        ]
-    if total_count is None:
-        total_count = len(tickets)
-    return {"page": 1, "size": page_size, "totalCount": total_count, "tickets": tickets}
+def test_unauthorised_raises_auth_error():
+    client = _client(lambda request: httpx.Response(401))
+    with pytest.raises(AuthError, match="expired"):
+        list(client.receipts())
 
 
-def _detail_json() -> dict:
-    return json.loads(FIXTURE.read_text())
+def test_token_redirect_to_login_raises_auth_error():
+    client = _client(lambda request: httpx.Response(302, headers={"location": "/login"}))
+    with pytest.raises(AuthError):
+        client.check_session()
 
 
-def _make_client() -> LidlClient:
-    client = LidlClient(
-        refresh_token="test_refresh",
-        country="GB",
-        language="en",
+def test_coupons_parse():
+    client = _client(
+        lambda request: httpx.Response(
+            200, json={"sections": [{"id": "AllStores", "promotions": [_promotion(locked=True)]}]}
+        )
     )
-    client._http = MagicMock(spec=httpx.Client)
-    return client
+    [coupon] = client.coupons()
+    assert coupon.description == "£5 off when you spend £40"
+    assert coupon.is_locked and not coupon.is_activated
+    assert coupon.start_date == datetime(2026, 10, 26, 6, 32, 38, 20000, tzinfo=UTC)
+    assert coupon.image_url == "https://example.test/c1.png"
 
 
-def _setup_token(client: LidlClient, include_refresh: bool = True) -> None:
-    """Configure mock to return a valid token on the next POST call."""
-    client._http.post.return_value = _mock_response(
-        json_data=_token_json(include_refresh),
-    )
+def test_activate_sends_bearer_and_csrf_and_reuses_them():
+    requests: list[httpx.Request] = []
+    client = _client(_write_routes(requests, httpx.Response(202)))
+
+    client.activate_coupon("c1")
+    client.deactivate_coupon("c1")
+
+    writes = [r for r in requests if r.url.path == ACTIVATION]
+    assert [r.method for r in writes] == ["POST", "DELETE"]
+    for r in writes:
+        assert r.headers["Authorization"] == "Bearer jwt"
+        assert r.headers["X-CSRF-TOKEN"] == "csrf"
+        assert r.url.params["language"] == "en-GB"
+    assert sum(r.url.path == "/mla/api/v1/token" for r in requests) == 1
 
 
-class TestTokenRenewal:
-    def test_renews_token_on_first_call(self):
-        client = _make_client()
-        _setup_token(client)
-        headers = client._auth_headers()
-        assert headers["Authorization"] == "Bearer test_access_token"
-        client._http.post.assert_called_once()
-
-    def test_reuses_token_when_not_expired(self):
-        client = _make_client()
-        _setup_token(client)
-        client._auth_headers()
-        client._auth_headers()
-        assert client._http.post.call_count == 1
-
-    def test_renewal_failure_raises_auth_error(self):
-        client = _make_client()
-        client._http.post.return_value = _mock_response(
-            status_code=401,
-            text="invalid_grant",
-        )
-        with pytest.raises(AuthError, match="Token renewal failed: 401"):
-            client._auth_headers()
-
-    def test_renewal_updates_refresh_token(self):
-        client = _make_client()
-        _setup_token(client, include_refresh=True)
-        client._auth_headers()
-        assert client._refresh_token == "new_refresh_token"
-
-    def test_renewal_keeps_old_refresh_token_when_not_returned(self):
-        client = _make_client()
-        _setup_token(client, include_refresh=False)
-        client._auth_headers()
-        assert client._refresh_token == "test_refresh"
-
-    def test_auth_headers_contain_required_fields(self):
-        client = _make_client()
-        _setup_token(client)
-        headers = client._auth_headers()
-        assert "Authorization" in headers
-        assert headers["App-Version"] == "16.45.5"
-        assert headers["Operating-System"] == "iOs"
-        assert headers["Accept-Language"] == "en"
-
-    def test_custom_app_version(self):
-        client = LidlClient(
-            refresh_token="test",
-            country="GB",
-            language="en",
-            app_version="17.0.0",
-        )
-        client._http = MagicMock(spec=httpx.Client)
-        _setup_token(client)
-        headers = client._auth_headers()
-        assert headers["App-Version"] == "17.0.0"
-
-
-class TestGet:
-    def test_get_passes_extra_headers(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(json_data={"ok": True})
-        client._get("https://example.com", extra_headers={"Country": "GB"})
-        call_headers = client._http.get.call_args.kwargs["headers"]
-        assert call_headers["Country"] == "GB"
-        assert "Authorization" in call_headers
-
-    def test_get_raises_on_http_error(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(status_code=500)
-        with pytest.raises(httpx.HTTPStatusError):
-            client._get("https://example.com")
-
-
-class TestReceipts:
-    def test_latest_receipt(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.side_effect = [
-            _mock_response(json_data=_tickets_json()),
-            _mock_response(json_data=_detail_json()),
-        ]
-        receipt = client.latest_receipt()
-        assert isinstance(receipt, Receipt)
-        assert receipt.total == 12.38
-        assert len(receipt.items) == 7
-
-    def test_latest_receipt_no_receipts_raises(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(
-            json_data=_tickets_json(tickets=[], total_count=0),
-        )
-        with pytest.raises(ILidlError, match="No receipts found"):
-            client.latest_receipt()
-
-    def test_receipt_by_id(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(json_data=_detail_json())
-        receipt = client.receipt("receipt123")
-        assert receipt.id == "13001459742026031831079"
-        assert receipt.store.name == "Llandaff"
-
-    def test_receipts_single_page(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(json_data=_tickets_json())
-        result = client.receipts()
-        assert len(result) == 1
-        assert result[0].id == "receipt123"
-
-    def test_receipts_pagination(self):
-        """Two pages: page 1 has 2 tickets, page 2 has 1 ticket."""
-        ticket_a = {
-            "id": "a",
-            "date": "2026-03-18T10:00:00+00:00",
-            "totalAmount": 5.00,
-            "currency": {"code": "GBP"},
-            "storeCode": "GB1",
-        }
-        ticket_b = {**ticket_a, "id": "b"}
-        ticket_c = {**ticket_a, "id": "c"}
-        page1 = _mock_response(
-            json_data={
-                "page": 1,
-                "size": 2,
-                "totalCount": 3,
-                "tickets": [ticket_a, ticket_b],
-            }
-        )
-        page2 = _mock_response(
-            json_data={
-                "page": 2,
-                "size": 2,
-                "totalCount": 3,
-                "tickets": [ticket_c],
-            }
-        )
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.side_effect = [page1, page2]
-        result = client.receipts()
-        assert len(result) == 3
-        assert [r.id for r in result] == ["a", "b", "c"]
-
-    def test_receipts_only_favourite(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(json_data=_tickets_json())
-        client.receipts(only_favourite=True)
-        url = client._http.get.call_args_list[0].args[0]
-        assert "onlyFavorite=True" in url
-
-
-class TestCoupons:
-    def test_coupons_parses_sections(self):
-        client = _make_client()
-        _setup_token(client)
-        coupon_data = {
-            "sections": [
-                {
-                    "promotions": [
-                        {
-                            "id": "c1",
-                            "title": "Free Pizza",
-                            "validity": {
-                                "start": "2026-03-01T00:00:00+00:00",
-                                "end": "2026-03-31T23:59:59+00:00",
-                            },
-                            "discount": {
-                                "title": "50% off",
-                                "description": "on all pizzas",
-                            },
-                            "image": "https://example.com/pizza.jpg",
-                            "isActivated": True,
-                        }
-                    ]
-                }
-            ]
-        }
-        client._http.get.return_value = _mock_response(json_data=coupon_data)
-        coupons = client.coupons()
-        assert len(coupons) == 1
-        assert coupons[0].id == "c1"
-        assert coupons[0].title == "Free Pizza"
-        assert coupons[0].description == "50% off on all pizzas"
-        assert coupons[0].image_url == "https://example.com/pizza.jpg"
-        assert coupons[0].is_activated is True
-
-    def test_coupons_empty_sections(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.get.return_value = _mock_response(
-            json_data={"sections": []},
-        )
-        assert client.coupons() == []
-
-    def test_activate_coupon(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.post.side_effect = [
-            _mock_response(json_data=_token_json()),
-            _mock_response(),
-        ]
+def test_activate_412_raises_coupon_error_with_reason():
+    reason = "'StartValidityDate' must be less or equal than current date."
+    client = _client(_write_routes([], httpx.Response(412, text=reason)))
+    with pytest.raises(CouponError) as exc:
         client.activate_coupon("c1")
-        assert client._http.post.call_count == 2
-        activate_call = client._http.post.call_args_list[1]
-        assert "c1/activation" in activate_call.args[0]
-        assert activate_call.kwargs["headers"]["Country"] == "GB"
-
-    def test_activate_coupon_http_error(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.post.side_effect = [
-            _mock_response(json_data=_token_json()),
-            _mock_response(status_code=409),
-        ]
-        with pytest.raises(httpx.HTTPStatusError):
-            client.activate_coupon("c1")
-
-    def test_deactivate_coupon(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.delete.return_value = _mock_response()
-        client.deactivate_coupon("c1")
-        url = client._http.delete.call_args.args[0]
-        assert "c1/activation" in url
-
-    def test_deactivate_coupon_http_error(self):
-        client = _make_client()
-        _setup_token(client)
-        client._http.delete.return_value = _mock_response(status_code=404)
-        with pytest.raises(httpx.HTTPStatusError):
-            client.deactivate_coupon("c1")
+    assert exc.value.reason == reason
 
 
-class TestTicketConversion:
-    def test_summary_to_receipt(self):
-        ticket = {
-            "id": "r1",
-            "date": "2026-03-18T19:26:50+00:00",
-            "totalAmount": 12.38,
-            "currency": {"code": "GBP", "symbol": "\u00a3"},
-            "storeCode": "GB1459",
-        }
-        receipt = LidlClient._ticket_summary_to_receipt(ticket)
-        assert receipt.id == "r1"
-        assert receipt.total == 12.38
-        assert receipt.currency == "GBP"
-        assert receipt.store.id == "GB1459"
-        assert receipt.items == []
+def test_missing_xsrf_cookie_raises_auth_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/mla/api/v1/token":
+            return httpx.Response(200, json={"token": "jwt"})
+        return httpx.Response(200)
 
-    def test_summary_missing_currency(self):
-        ticket = {
-            "id": "r1",
-            "date": "2026-03-18T19:26:50+00:00",
-            "totalAmount": 5.00,
-        }
-        receipt = LidlClient._ticket_summary_to_receipt(ticket)
-        assert receipt.currency == ""
-
-    def test_detail_to_receipt(self):
-        data = json.loads(FIXTURE.read_text())
-        receipt = LidlClient._ticket_detail_to_receipt(data)
-        assert receipt.store.name == "Llandaff"
-        assert receipt.store.locality == "Cardiff"
-        assert len(receipt.items) == 7
-        assert receipt.payment_method == "CARD"
-        assert "A" in receipt.vat_breakdown
-        assert "B" in receipt.vat_breakdown
+    with pytest.raises(AuthError, match="XSRF"):
+        _client(handler).activate_coupon("c1")
 
 
-class TestClientLifecycle:
-    def test_context_manager(self):
-        client = _make_client()
-        with client:
-            pass
-        client._http.close.assert_called_once()
+def test_receipt_dates_are_uk_local_time_despite_utc_label():
+    ticket = {**_ticket(1), "date": "2026-05-17T13:15:48+00:00"}
+    client = _client(
+        lambda request: httpx.Response(
+            200, json={"items": [ticket], "page": 1, "size": 10, "totalCount": 1}
+        )
+    )
+    [receipt] = client.receipts()
+    assert receipt.date.astimezone(UTC) == datetime(2026, 5, 17, 12, 15, 48, tzinfo=UTC)
 
-    def test_close(self):
-        client = _make_client()
-        client.close()
-        client._http.close.assert_called_once()
+
+def _expiring_site(accounts_logged_in: bool, visited: list[str]):
+    """Fake lidl.co.uk whose session renews through accounts.lidl.com like the real site."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = request.url
+        visited.append(f"{url.host}{url.path}")
+        fresh = "authToken=fresh" in request.headers.get("cookie", "")
+        if url.host == "accounts.lidl.com":
+            if not accounts_logged_in:
+                return httpx.Response(200, text="<html>Log in</html>")
+            return httpx.Response(
+                302, headers={"location": "https://www.lidl.co.uk/user-api/signin-oidc?code=c"}
+            )
+        if url.path == "/user-api/login":
+            return httpx.Response(
+                302, headers={"location": "https://accounts.lidl.com/connect/authorize"}
+            )
+        if url.path == "/user-api/signin-oidc":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "/mla/api/v1/token?country_code=gb",
+                    "set-cookie": "authToken=fresh; Path=/; Secure; HttpOnly",
+                },
+            )
+        if url.path == "/mla/api/v1/token":
+            if fresh:
+                return httpx.Response(200, json={"token": "jwt", "source": "3"})
+            return httpx.Response(302, headers={"location": "/user-api/login?step=login"})
+        if url.path == "/mre/api/v1/tickets":
+            if not fresh:
+                return httpx.Response(401)
+            return httpx.Response(200, json={"items": [], "page": 1, "size": 10, "totalCount": 0})
+        return httpx.Response(404)
+
+    return handler
+
+
+def test_expired_session_renews_through_accounts_and_retries():
+    visited: list[str] = []
+    client = LidlClient(
+        {"authToken": "stale"}, transport=httpx.MockTransport(_expiring_site(True, visited))
+    )
+    assert list(client.receipts()) == []
+    assert "accounts.lidl.com/connect/authorize" in visited
+    assert visited[-1] == "www.lidl.co.uk/mre/api/v1/tickets"
+
+
+def test_expired_accounts_login_raises_auth_error():
+    visited: list[str] = []
+    client = LidlClient(
+        {"authToken": "stale"}, transport=httpx.MockTransport(_expiring_site(False, visited))
+    )
+    with pytest.raises(AuthError, match="could not be renewed"):
+        client.check_session()
+    assert "accounts.lidl.com/connect/authorize" in visited

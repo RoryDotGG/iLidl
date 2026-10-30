@@ -1,69 +1,74 @@
-"""HTTP client for the Lidl Plus API."""
+"""HTTP client for the Lidl UK web API (www.lidl.co.uk)."""
 
-import base64
-from datetime import UTC, datetime, timedelta
+import time
+from collections.abc import Iterator
+from datetime import datetime
+from decimal import Decimal
+from http.cookiejar import CookieJar
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
-from ilidl.exceptions import AuthError, ILidlError
+from ilidl.exceptions import AuthError, CouponError, ILidlError, ReceiptParseError
 from ilidl.models import Coupon, Receipt, Store
 from ilidl.parser import parse_receipt_html
 
-DEFAULT_APP_VERSION = "16.45.5"
-AUTH_API = "https://accounts.lidl.com"
-TICKETS_API = "https://tickets.lidlplus.com/api"
-COUPONS_API = "https://coupons.lidlplus.com/app/api"
-CLIENT_ID = "LidlPlusNativeClient"
+BASE_URL = "https://www.lidl.co.uk"
+COUNTRY = "GB"
+LANGUAGE = "en-GB"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+LONDON = ZoneInfo("Europe/London")
+# The bearer token lasts 30 minutes; renew a little early.
+_TOKEN_TTL_SECONDS = 25 * 60
 
 
 class _RetryTransport(httpx.BaseTransport):
-    """Retries requests on connection errors."""
+    """Retries requests on connection errors, which happen before anything is sent."""
 
     def __init__(self, retries: int = 3) -> None:
         self._transport = httpx.HTTPTransport()
         self._retries = retries
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        last_exc: httpx.ConnectError | None = None
-        for _ in range(self._retries):
+        for attempt in range(self._retries):
             try:
                 return self._transport.handle_request(request)
-            except httpx.ConnectError as exc:
-                last_exc = exc
-        if last_exc is not None:
-            raise last_exc
-        return self._transport.handle_request(request)
+            except httpx.ConnectError:
+                if attempt == self._retries - 1:
+                    raise
+        raise AssertionError("unreachable")
 
     def close(self) -> None:
         self._transport.close()
 
 
 class LidlClient:
-    """Client for the Lidl Plus API.
+    """Client for the Lidl UK web API, authenticated by the website's session cookies.
 
-    Handles token renewal, receipt listing/detail, and coupons.
+    Reads need only the cookies. Coupon changes also need a bearer token from
+    ``/mla/api/v1/token`` and an ``X-CSRF-TOKEN`` header echoing the ``XSRF-TOKEN`` cookie
+    set by ``/prm/antiforgerytoken``; both are fetched on demand.
     """
 
     def __init__(
         self,
-        refresh_token: str,
-        country: str,
-        language: str,
-        app_version: str = DEFAULT_APP_VERSION,
+        cookies: CookieJar | dict[str, str],
+        *,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._refresh_token = refresh_token
-        self._country = country.upper()
-        self._language = language.lower()
-        self._app_version = app_version
-        self._access_token: str = ""
-        self._token_expires: datetime = datetime.min.replace(
-            tzinfo=UTC,
-        )
         self._http = httpx.Client(
-            transport=_RetryTransport(retries=3),
+            base_url=BASE_URL,
+            cookies=cookies,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            transport=transport or _RetryTransport(),
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
+        self._write_headers: dict[str, str] = {}
+        self._write_headers_expire = 0.0
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -75,180 +80,170 @@ class LidlClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def _renew_token(self) -> None:
-        secret = base64.b64encode(
-            f"{CLIENT_ID}:secret".encode(),
-        ).decode()
-        resp = self._http.post(
-            f"{AUTH_API}/connect/token",
-            headers={
-                "Authorization": f"Basic {secret}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={
-                "refresh_token": self._refresh_token,
-                "grant_type": "refresh_token",
-            },
-        )
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        resp = self._http.request(method, path, **kwargs)
+        # An expired session gives 401 on API calls and a redirect to the login page on /mla.
+        # Writes are not retried: they fetch the bearer token first, which renews the session.
+        if _logged_out(resp) and method == "GET" and self._renew_session():
+            resp = self._http.request(method, path, **kwargs)
+        if _logged_out(resp):
+            msg = (
+                "Lidl session expired and could not be renewed. Log in at"
+                " https://www.lidl.co.uk/mre/ in your browser and retry."
+            )
+            raise AuthError(msg)
+        return resp
+
+    def _renew_session(self) -> bool:
+        """Get a fresh ``authToken``, which lasts 30 minutes, the way the website does.
+
+        A logged-out request redirects through ``/user-api/login`` to accounts.lidl.com, which
+        redirects straight back with a code while its own login lasts, and
+        ``/user-api/signin-oidc`` then sets new session cookies. Needs the accounts.lidl.com
+        cookies in the jar. Returns whether the chain ended back on the token endpoint.
+        """
+        self._write_headers_expire = 0.0
         try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            msg = f"Token renewal failed: {resp.status_code} {resp.text}"
-            raise AuthError(msg) from exc
-        data = resp.json()
-        self._access_token = data["access_token"]
-        self._token_expires = datetime.now(
-            tz=UTC,
-        ) + timedelta(seconds=data["expires_in"])
-        if "refresh_token" in data:
-            self._refresh_token = data["refresh_token"]
+            resp = self._http.get("/mla/api/v1/token", follow_redirects=True)
+        except httpx.TooManyRedirects:
+            return False
+        return resp.status_code == 200 and resp.url.path == "/mla/api/v1/token"
 
-    def _auth_headers(self) -> dict[str, str]:
-        now = datetime.now(tz=UTC)
-        if not self._access_token or now >= self._token_expires:
-            self._renew_token()
-        return {
-            "Authorization": f"Bearer {self._access_token}",
-            "App-Version": self._app_version,
-            "Operating-System": "iOs",
-            "App": "com.lidl.eci.lidl.plus",
-            "Accept-Language": self._language,
-        }
-
-    def _get(
-        self,
-        url: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        headers = self._auth_headers()
-        if extra_headers:
-            headers.update(extra_headers)
-        resp = self._http.get(url, headers=headers)
+    def _get(self, path: str, **params: Any) -> Any:
+        resp = self._request("GET", path, params=params)
         resp.raise_for_status()
         return resp.json()
 
-    def receipts(
-        self,
-        only_favourite: bool = False,
-    ) -> list[Receipt]:
-        """Fetch all receipts, paginating automatically."""
-        url = f"{TICKETS_API}/v2/{self._country}/tickets"
-        first_page = self._get(
-            f"{url}?pageNumber=1&onlyFavorite={only_favourite}",
-        )
-        tickets = first_page["tickets"]
-        total_count = first_page["totalCount"]
-        page_size = first_page["size"]
-        for page in range(2, (total_count // page_size) + 2):
-            page_data = self._get(
-                f"{url}?pageNumber={page}&onlyFavorite={only_favourite}",
-            )
-            tickets.extend(page_data["tickets"])
-        return [self._ticket_summary_to_receipt(t) for t in tickets]
+    def check_session(self) -> None:
+        """Raise ``AuthError`` unless the cookies hold a live session."""
+        self._get("/mla/api/v1/token")
+
+    # Receipts
+
+    def receipts(self) -> Iterator[Receipt]:
+        """Yield receipt summaries, newest first, fetching 10 per page as needed."""
+        page = 1
+        while True:
+            data = self._get("/mre/api/v1/tickets", country=COUNTRY, page=page)
+            for ticket in data["items"]:
+                yield Receipt(
+                    id=ticket["id"],
+                    date=_receipt_date(ticket["date"]),
+                    store=Store(name=ticket.get("store") or ""),
+                    total=Decimal(str(ticket["totalAmount"])),
+                    article_count=ticket.get("articlesCount"),
+                )
+            if not data["items"] or page * data["size"] >= data["totalCount"]:
+                return
+            page += 1
 
     def receipt(self, ticket_id: str) -> Receipt:
-        """Fetch a single receipt by ID with full detail."""
-        url = f"{TICKETS_API}/v3/{self._country}/tickets/{ticket_id}"
-        data = self._get(url)
-        return self._ticket_detail_to_receipt(data)
-
-    def latest_receipt(self) -> Receipt:
-        """Fetch the most recent receipt with full detail."""
-        url = f"{TICKETS_API}/v2/{self._country}/tickets"
-        first_page = self._get(
-            f"{url}?pageNumber=1&onlyFavorite=False",
-        )
-        tickets = first_page["tickets"]
-        if not tickets:
-            msg = "No receipts found"
-            raise ILidlError(msg)
-        return self.receipt(tickets[0]["id"])
-
-    def _coupon_headers(self) -> dict[str, str]:
-        return {"Country": self._country}
-
-    def coupons(self) -> list[Coupon]:
-        """Fetch all available coupons."""
-        url = f"{COUPONS_API}/v2/promotionsList"
-        data = self._get(url, self._coupon_headers())
-        result: list[Coupon] = []
-        for section in data.get("sections", []):
-            for p in section.get("promotions", []):
-                validity = p.get("validity", {})
-                discount = p.get("discount", {})
-                desc = discount.get("description", "")
-                if discount.get("title"):
-                    desc = f"{discount['title']} {desc}".strip()
-                result.append(
-                    Coupon(
-                        id=p["id"],
-                        title=p.get("title", ""),
-                        description=desc,
-                        image_url=p.get("image"),
-                        start_date=datetime.fromisoformat(
-                            validity["start"],
-                        ),
-                        end_date=datetime.fromisoformat(
-                            validity["end"],
-                        ),
-                        is_activated=p.get("isActivated", False),
-                    )
-                )
-        return result
-
-    def activate_coupon(self, coupon_id: str) -> None:
-        """Activate a coupon by ID."""
-        url = f"{COUPONS_API}/v1/promotions/{coupon_id}/activation"
-        headers = self._auth_headers()
-        headers.update(self._coupon_headers())
-        resp = self._http.post(url, headers=headers)
-        resp.raise_for_status()
-
-    def deactivate_coupon(self, coupon_id: str) -> None:
-        """Deactivate a coupon by ID."""
-        url = f"{COUPONS_API}/v2/promotions/{coupon_id}/activation"
-        headers = self._auth_headers()
-        headers.update(self._coupon_headers())
-        resp = self._http.delete(url, headers=headers)
-        resp.raise_for_status()
-
-    @staticmethod
-    def _ticket_summary_to_receipt(ticket: dict[str, Any]) -> Receipt:
-        currency = ticket.get("currency", {})
+        """Fetch a single receipt with its line items."""
+        data = self._get(f"/mre/api/v1/tickets/{ticket_id}", country=COUNTRY, languageCode=LANGUAGE)
+        ticket = data["ticket"]
+        html = ticket.get("htmlPrintedReceipt") or ""
+        if not html:
+            msg = f"Receipt {ticket_id} has no printed receipt to parse"
+            raise ReceiptParseError(msg, html)
+        parsed = parse_receipt_html(html)
+        store = ticket.get("store") or {}
         return Receipt(
             id=ticket["id"],
-            date=datetime.fromisoformat(ticket["date"]),
+            date=_receipt_date(ticket["date"]),
             store=Store(
-                id=ticket.get("storeCode", ""),
-                name="",
-                address="",
-                postal_code="",
-                locality="",
+                name=store.get("name") or "",
+                address=store.get("address") or "",
+                postal_code=store.get("postalCode") or "",
+                locality=store.get("locality") or "",
             ),
-            items=[],
-            total=ticket["totalAmount"],
-            currency=currency.get("code", ""),
-        )
-
-    @staticmethod
-    def _ticket_detail_to_receipt(data: dict[str, Any]) -> Receipt:
-        store_data = data.get("store", {})
-        store = Store(
-            id=store_data.get("id", ""),
-            name=store_data.get("name", ""),
-            address=store_data.get("address", ""),
-            postal_code=store_data.get("postalCode", ""),
-            locality=store_data.get("locality", ""),
-        )
-        html = data.get("htmlPrintedReceipt", "")
-        parsed = parse_receipt_html(html)
-        return Receipt(
-            id=data["id"],
-            date=datetime.fromisoformat(data["date"]),
-            store=store,
-            items=parsed.items,
+            # ticket.totalAmount is always 0 here; the printed receipt has the real total.
             total=parsed.total,
-            currency=data.get("currency", {}).get("code", "GBP"),
+            article_count=len(parsed.items),
+            items=parsed.items,
             payment_method=parsed.payment_method,
             vat_breakdown=parsed.vat_breakdown,
+            coupons_used=[c.get("title") or "" for c in data.get("coupons") or []],
+            points=(data.get("collectingModel") or {}).get("points"),
         )
+
+    def latest_receipt(self) -> Receipt:
+        """Fetch the most recent receipt with its line items."""
+        latest = next(self.receipts(), None)
+        if latest is None:
+            msg = "No receipts found"
+            raise ILidlError(msg)
+        return self.receipt(latest.id)
+
+    # Coupons
+
+    def coupons(self) -> list[Coupon]:
+        """Fetch all coupons.
+
+        Time-slot coupons (such as the bakery 20% coupon) get a new ID for each slot, so
+        re-list before activating rather than reusing old IDs.
+        """
+        data = self._get(f"/prm/api/v1/{COUNTRY}/promotionslist", language=LANGUAGE)
+        return [
+            Coupon(
+                id=p["id"],
+                offer=p.get("offer") or "",
+                title=p.get("title") or "",
+                description=p.get("description") or "",
+                start_date=datetime.fromisoformat(p["startValidityDate"]),
+                end_date=datetime.fromisoformat(p["endValidityDate"]),
+                is_activated=bool(p.get("isActivated")),
+                is_locked=bool(p.get("locked")),
+                is_processing=bool(p.get("isProcessing")),
+                image_url=(p.get("image") or {}).get("url"),
+            )
+            for section in data.get("sections") or []
+            for p in section.get("promotions") or []
+        ]
+
+    def activate_coupon(self, coupon_id: str) -> None:
+        """Activate a coupon. Raises ``CouponError`` if Lidl refuses."""
+        self._set_activation(coupon_id, "POST")
+
+    def deactivate_coupon(self, coupon_id: str) -> None:
+        """Deactivate a coupon. Raises ``CouponError`` if Lidl refuses."""
+        self._set_activation(coupon_id, "DELETE")
+
+    def _set_activation(self, coupon_id: str, method: str) -> None:
+        resp = self._request(
+            method,
+            f"/prm/api/v1/{COUNTRY}/promotions/{coupon_id}/activation",
+            params={"language": LANGUAGE},
+            headers=self._get_write_headers(),
+        )
+        # 412 is a business error with a plain-text reason, e.g. PromotionIsProcessing or
+        # "'StartValidityDate' must be less or equal than current date."
+        if resp.status_code == 412:
+            raise CouponError(coupon_id, resp.text.strip() or "refused")
+        resp.raise_for_status()
+
+    def _get_write_headers(self) -> dict[str, str]:
+        if time.monotonic() < self._write_headers_expire:
+            return self._write_headers
+        token = self._get("/mla/api/v1/token")["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+        resp = self._request("GET", "/prm/antiforgerytoken", headers=auth)
+        resp.raise_for_status()
+        xsrf = resp.cookies.get("XSRF-TOKEN") or next(
+            (c.value for c in self._http.cookies.jar if c.name == "XSRF-TOKEN"), None
+        )
+        if not xsrf:
+            msg = "Lidl did not return an XSRF-TOKEN cookie"
+            raise AuthError(msg)
+        self._write_headers = {**auth, "X-CSRF-TOKEN": xsrf}
+        self._write_headers_expire = time.monotonic() + _TOKEN_TTL_SECONDS
+        return self._write_headers
+
+
+def _logged_out(resp: httpx.Response) -> bool:
+    return resp.status_code == 401 or resp.is_redirect
+
+
+def _receipt_date(value: str) -> datetime:
+    # Receipt times are UK wall-clock time, matching the till printout, even when the API
+    # labels them +00:00 during British Summer Time.
+    return datetime.fromisoformat(value).replace(tzinfo=LONDON)

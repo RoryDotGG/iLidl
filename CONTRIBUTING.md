@@ -8,8 +8,7 @@ Thanks for your interest in contributing to iLidl!
 git clone https://github.com/RoryDotGG/iLidl.git
 cd iLidl
 uv venv && source .venv/bin/activate
-uv pip install -e ".[dev,auth]"
-playwright install chromium
+uv pip install -e ".[dev]"
 ```
 
 ## Development
@@ -38,6 +37,7 @@ uv run ruff format .
 
 ## Notes
 
-- UK receipts are the primary focus. Other countries may work but are untested.
-- The Lidl Plus API is undocumented and may change without notice.
-- Keep the `App-Version` header realistic. The API rejects fake versions.
+- Only Lidl UK (`www.lidl.co.uk`) is supported.
+- The API is undocumented and may change without notice. Endpoints are recorded in
+  [docs/lidl-web-api.md](docs/lidl-web-api.md); update it when you find changes.
+- Tests replace lidl.co.uk with `httpx.MockTransport`. Fixtures must not contain real receipts.
