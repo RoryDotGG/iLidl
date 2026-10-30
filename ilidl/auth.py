@@ -1,259 +1,33 @@
-"""Playwright-based OAuth2 PKCE authentication for Lidl Plus."""
+"""Load the lidl.co.uk session cookies from a logged-in browser."""
 
-import base64
-import contextlib
-import getpass
-import hashlib
-import re
-import secrets
-from typing import Any
+import os
+from http.cookiejar import CookieJar
 
-import httpx
+import browser_cookie3
 
-from ilidl.config import Config
 from ilidl.exceptions import AuthError
 
-AUTH_API = "https://accounts.lidl.com"
-CLIENT_ID = "LidlPlusNativeClient"
-REDIRECT_URI = "com.lidlplus.app://callback"
-SCOPES = "openid profile offline_access lpprofile lpapis"
+BROWSERS = {fn.__name__: fn for fn in browser_cookie3.all_browsers}
+COOKIE_ENV = "LIDL_COOKIE"
 
 
-def _generate_pkce() -> tuple[str, str]:
-    """Generate PKCE code_verifier and code_challenge."""
-    verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(verifier.encode()).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return verifier, challenge
+def load_cookies(browser: str) -> CookieJar | dict[str, str]:
+    """Return lidl.co.uk cookies.
 
+    ``LIDL_COOKIE`` (a ``Cookie`` header copied from the browser's DevTools) wins over the
+    browser's cookie store.
 
-def _build_auth_url(challenge: str, country: str, language: str) -> str:
-    """Build the OAuth authorization URL."""
-    params = (
-        f"client_id={CLIENT_ID}"
-        f"&response_type=code"
-        f"&scope={SCOPES.replace(' ', '+')}"
-        f"&redirect_uri={REDIRECT_URI.replace(':', '%3A').replace('/', '%2F')}"
-        f"&code_challenge={challenge}"
-        f"&code_challenge_method=S256"
-        f"&Country={country.upper()}"
-        f"&language={language.lower()}-{country.upper()}"
-    )
-    return f"{AUTH_API}/connect/authorize?{params}"
-
-
-def _exchange_code(code: str, verifier: str) -> dict[str, Any]:
-    """Exchange authorization code for tokens."""
-    secret = base64.b64encode(f"{CLIENT_ID}:secret".encode()).decode()
-    resp = httpx.post(
-        f"{AUTH_API}/connect/token",
-        headers={
-            "Authorization": f"Basic {secret}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-            "code_verifier": verifier,
-        },
-        timeout=30,
-    )
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        msg = f"Token exchange failed: {resp.status_code} {resp.text}"
-        raise AuthError(msg) from exc
-    return resp.json()
-
-
-def _dbg(debug: bool, page: Any, name: str, msg: str = "") -> None:
-    """Save a debug screenshot and optionally print a message."""
-    if not debug:
-        return
-    page.screenshot(path=f"/tmp/ilidl_{name}.png")
-    if msg:
-        print(f"DEBUG {msg}")
-
-
-def login(
-    config: Config,
-    *,
-    debug: bool = False,
-    headless: bool = False,
-) -> str:
-    """Run interactive login via phone number. Returns refresh token."""
-    try:
-        from playwright._impl._errors import TimeoutError as PwTimeout
-        from playwright.sync_api import sync_playwright
-    except ImportError as e:
-        msg = (
-            "Playwright is required for login. "
-            "Install with: uv pip install 'ilidl[auth]'"
-        )
-        raise AuthError(msg) from e
-
-    verifier, challenge = _generate_pkce()
-    url = _build_auth_url(challenge, config.country, config.language)
-
-    phone = input(
-        "Phone number (local, e.g. 7400123456): "
-    ).strip()
-    password = getpass.getpass("Password: ")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
-
-        code: str = ""
-
-        def handle_request(request):
-            nonlocal code
-            req_url = request.url
-            if debug:
-                print(f"DEBUG request: {req_url[:120]}")
-            if req_url.startswith("com.lidlplus.app://"):
-                match = re.search(r"code=([^&]+)", req_url)
-                if match:
-                    code = match.group(1)
-                    if debug:
-                        print(f"DEBUG got code: {code}")
-
-        def handle_response(response):
-            nonlocal code
-            # Check for 302 redirects to the app callback
-            if code:
-                return
-            location = response.headers.get("location", "")
-            if location.startswith("com.lidlplus.app://"):
-                match = re.search(r"code=([^&]+)", location)
-                if match:
-                    code = match.group(1)
-                    if debug:
-                        print(f"DEBUG got code from redirect: {code}")
-
-        page.on("request", handle_request)
-        page.on("response", handle_response)
-
-        page.goto(url)
-        page.wait_for_load_state("networkidle")
-        _dbg(debug, page, "01_welcome", f"url: {page.url}")
-
-        # Click "Log in" on the welcome page
-        page.locator(
-            "button:has-text('Log in'), a:has-text('Log in')"
-        ).first.click(timeout=5000)
-        page.wait_for_load_state("networkidle")
-        _dbg(debug, page, "02_login_form", "on login form")
-
-        # Switch to phone number login
-        page.locator(
-            "button:has-text('phone number'), "
-            "a:has-text('phone number')"
-        ).first.click(timeout=5000)
-        page.wait_for_load_state("networkidle")
-        _dbg(debug, page, "03_phone_form", f"url: {page.url}")
-
-        # Fill local phone number (country code is pre-selected)
-        phone_field = page.locator(
-            "input[type='tel'], "
-            "input[name='PhoneNumber'], "
-            "input[name='phoneNumber']"
-        ).first
-        phone_field.fill(phone)
-
-        # Fill password
-        page.locator("input[type='password']").first.fill(password)
-        _dbg(debug, page, "04_filled")
-
-        # Submit and wait for the page to settle
-        page.locator(
-            "button:has-text('Log in'), "
-            "button[type='submit']"
-        ).first.click()
-        page.wait_for_load_state("networkidle")
-
-        # Wait for the next screen: verification code form,
-        # error alert, or redirect (captured by handlers).
-        if not code:
-            next_screen = (
-                "[role='alert'], "
-                "[name='VerificationCode'], "
-                "input[name='code'], "
-                "input[inputmode='numeric']"
-            )
-            with contextlib.suppress(PwTimeout):
-                page.wait_for_selector(
-                    next_screen,
-                    state="visible",
-                    timeout=30000,
-                )
-            page.wait_for_load_state("networkidle")
-        _dbg(debug, page, "05_after_submit", f"url: {page.url}")
-
-        # Check for error alert
-        if not code:
-            alert = page.locator("[role='alert']")
-            if alert.count() > 0 and alert.first.is_visible():
-                error_text = (
-                    alert.first.text_content() or ""
-                ).strip()
-                _dbg(debug, page, "05b_error")
-                browser.close()
-                msg = f"Login failed: {error_text}"
-                raise AuthError(msg)
-
-        # Handle verification code prompt
-        if not code:
-            verify_field = page.locator(
-                "[name='VerificationCode'], "
-                "input[name='code'], "
-                "input[inputmode='numeric']"
-            )
-            try:
-                verify_field.first.wait_for(
-                    state="visible", timeout=5000
-                )
-                _dbg(debug, page, "06_verify_prompt")
-                otp = input(
-                    "Enter verification code: "
-                ).strip()
-                verify_field.first.fill(otp)
-                page.locator(
-                    "button[type='submit'], "
-                    "button:has-text('Submit'), "
-                    "button:has-text('Verify')"
-                ).first.click()
-
-                with contextlib.suppress(PwTimeout):
-                    page.wait_for_url(
-                        "**/callback*", timeout=15000
-                    )
-                page.wait_for_timeout(3000)
-                _dbg(
-                    debug, page, "07_after_verify",
-                    f"url: {page.url}",
-                )
-            except PwTimeout:
-                if debug:
-                    print("DEBUG verify field not found")
-                _dbg(debug, page, "08_no_verify")
-
-        browser.close()
-
-    if not code:
-        hint = (
-            " Try without --headless."
-            if headless
-            else ""
-        )
-        msg = (
-            "Login failed: could not extract "
-            f"authorization code.{hint}"
-        )
+    Raises:
+        AuthError: If the browser is unknown or its cookie store cannot be read.
+    """
+    if raw := os.environ.get(COOKIE_ENV, "").strip():
+        pairs = (part.strip().split("=", 1) for part in raw.split(";") if "=" in part)
+        return {name: value for name, value in pairs}
+    if browser not in BROWSERS:
+        msg = f"Unknown browser {browser!r}. Choose one of: {', '.join(BROWSERS)}"
         raise AuthError(msg)
-
-    tokens = _exchange_code(code, verifier)
-    config.refresh_token = tokens["refresh_token"]
-    config.save()
-    return tokens["refresh_token"]
+    try:
+        return BROWSERS[browser](domain_name="lidl.co.uk")
+    except browser_cookie3.BrowserCookieError as exc:
+        msg = f"Could not read {browser} cookies ({exc}). Set {COOKIE_ENV} instead."
+        raise AuthError(msg) from exc

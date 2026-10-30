@@ -1,347 +1,146 @@
-"""Tests for ilidl CLI."""
+"""Tests for ilidl CLI, with the API client mocked."""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 from click.testing import CliRunner
 
-from ilidl.cli import _json_serial, cli
+from ilidl.auth import load_cookies
+from ilidl.cli import cli
+from ilidl.exceptions import AuthError, CouponError
 from ilidl.models import Coupon, Discount, Item, Receipt, Store
 
 
-def _sample_receipt(**overrides):
+def _receipt(day: int, **overrides) -> Receipt:
     defaults = {
-        "id": "receipt123",
-        "date": datetime(2026, 3, 18, 19, 26, 50),
-        "store": Store(
-            id="GB1459",
-            name="Llandaff",
-            address="Station Road",
-            postal_code="CF14 2FB",
-            locality="Cardiff",
-        ),
-        "items": [
-            Item(name="Heinz Beans", price=2.74, vat_group="A"),
-            Item(
-                name="Handwash",
-                price=0.59,
-                vat_group="B",
-                discounts=[Discount(description="Price Cut", amount=0.04)],
-            ),
-        ],
-        "total": 3.29,
-        "currency": "GBP",
-        "payment_method": "CARD",
+        "id": f"t{day}",
+        "date": datetime(2026, 10, day, 13, 0, tzinfo=UTC),
+        "store": Store(name="Testville", locality="Testford"),
+        "total": Decimal("4.04"),
+        "article_count": 4,
     }
-    defaults.update(overrides)
-    return Receipt(**defaults)
+    return Receipt(**{**defaults, **overrides})
 
 
-def _sample_coupon(**overrides):
+def _coupon(coupon_id: str, **overrides) -> Coupon:
     defaults = {
-        "id": "coupon123",
-        "title": "Free Pizza",
-        "start_date": datetime(2026, 3, 1),
-        "end_date": datetime(2026, 3, 31),
+        "id": coupon_id,
+        "offer": "£5",
+        "title": "off",
+        "description": f"Coupon {coupon_id}",
+        "start_date": datetime.now(UTC) - timedelta(days=1),
+        "end_date": datetime.now(UTC) + timedelta(days=1),
         "is_activated": False,
-        "description": "Buy 1 get 1 free",
     }
-    defaults.update(overrides)
-    return Coupon(**defaults)
+    return Coupon(**{**defaults, **overrides})
 
 
-class TestJsonSerial:
-    def test_serialises_datetime(self):
-        dt = datetime(2026, 3, 18, 19, 26, 50)
-        assert _json_serial(dt) == "2026-03-18T19:26:50"
-
-    def test_raises_for_unsupported_type(self):
-        with pytest.raises(TypeError, match="not serializable"):
-            _json_serial(set())
+@pytest.fixture
+def client():
+    mock = MagicMock()
+    with patch("ilidl.cli._get_client", return_value=mock):
+        yield mock
 
 
-class TestGetClient:
-    @patch("ilidl.cli.Config")
-    def test_not_logged_in(self, mock_config_cls):
-        mock_config_cls.return_value.refresh_token = ""
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts"])
-        assert result.exit_code == 1
-        assert "Not logged in" in result.output
+def test_not_logged_in(monkeypatch):
+    monkeypatch.delenv("LIDL_COOKIE", raising=False)
+    with patch("ilidl.cli.Config") as config:
+        config.return_value.browser = ""
+        result = CliRunner().invoke(cli, ["receipts"])
+    assert result.exit_code == 1
+    assert "ilidl login --browser" in result.output
 
 
-class TestReceiptCommand:
-    @patch("ilidl.cli._get_client")
-    def test_receipt_latest_json(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.latest_receipt.return_value = _sample_receipt()
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipt", "latest", "--json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert data["id"] == "receipt123"
-        assert data["total"] == 3.29
-
-    @patch("ilidl.cli._get_client")
-    def test_receipt_latest_table(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.latest_receipt.return_value = _sample_receipt()
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipt", "latest"])
-        assert result.exit_code == 0
-        assert "Llandaff" in result.output
-        assert "Heinz Beans" in result.output
-        assert "Price Cut" in result.output
-        assert "Paid by: CARD" in result.output
-        assert "TOTAL" in result.output
-
-    @patch("ilidl.cli._get_client")
-    def test_receipt_by_id(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.receipt.return_value = _sample_receipt()
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipt", "abc123"])
-        assert result.exit_code == 0
-        mock_client.receipt.assert_called_once_with("abc123")
-
-    @patch("ilidl.cli._get_client")
-    def test_receipt_table_shows_quantity(self, mock_get_client):
-        receipt = _sample_receipt(
-            items=[
-                Item(
-                    name="Loose Carrots",
-                    price=0.17,
-                    vat_group="A",
-                    quantity=0.24,
-                    unit_price=0.69,
-                ),
-            ],
-            total=0.17,
-        )
-        mock_client = MagicMock()
-        mock_client.latest_receipt.return_value = receipt
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipt", "latest"])
-        assert result.exit_code == 0
-        assert "0.24" in result.output
-
-    @patch("ilidl.cli._get_client")
-    def test_receipt_table_no_payment_method(self, mock_get_client):
-        receipt = _sample_receipt(payment_method=None)
-        mock_client = MagicMock()
-        mock_client.latest_receipt.return_value = receipt
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipt", "latest"])
-        assert result.exit_code == 0
-        assert "Paid by" not in result.output
+def test_auth_error_is_reported_without_traceback(client):
+    client.receipts.side_effect = AuthError("Lidl session expired or missing.")
+    result = CliRunner().invoke(cli, ["receipts"])
+    assert result.exit_code == 1
+    assert "Error: Lidl session expired" in result.output
 
 
-class TestReceiptsCommand:
-    @patch("ilidl.cli._get_client")
-    def test_receipts_table(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = [_sample_receipt()]
-        mock_get_client.return_value = mock_client
+def test_receipts_from_stops_paging_at_older_receipts(client):
+    def newest_first():
+        yield _receipt(29)
+        yield _receipt(20)
+        yield _receipt(10)
+        raise AssertionError("fetched past --from")
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts"])
-        assert result.exit_code == 0
-        assert "2026-03-18" in result.output
-        assert "Llandaff" in result.output
-        assert "3.29" in result.output
-
-    @patch("ilidl.cli._get_client")
-    def test_receipts_json(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = [_sample_receipt()]
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts", "--json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert len(data) == 1
-        assert data[0]["id"] == "receipt123"
-
-    @patch("ilidl.cli._get_client")
-    def test_receipts_empty(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = []
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts"])
-        assert result.exit_code == 0
-        assert "No receipts found" in result.output
-
-    @patch("ilidl.cli._get_client")
-    def test_receipts_date_filter_from(self, mock_get_client):
-        old = _sample_receipt(
-            id="old",
-            date=datetime(2026, 1, 1, 10, 0, 0),
-        )
-        new = _sample_receipt(
-            id="new",
-            date=datetime(2026, 3, 18, 19, 26, 50),
-        )
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = [old, new]
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts", "--from", "2026-03-01", "--json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert len(data) == 1
-        assert data[0]["id"] == "new"
-
-    @patch("ilidl.cli._get_client")
-    def test_receipts_date_filter_to(self, mock_get_client):
-        old = _sample_receipt(
-            id="old",
-            date=datetime(2026, 1, 1, 10, 0, 0),
-        )
-        new = _sample_receipt(
-            id="new",
-            date=datetime(2026, 3, 18, 19, 26, 50),
-        )
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = [old, new]
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts", "--to", "2026-02-01", "--json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert len(data) == 1
-        assert data[0]["id"] == "old"
-
-    @patch("ilidl.cli._get_client")
-    def test_receipts_store_falls_back_to_id(self, mock_get_client):
-        receipt = _sample_receipt(
-            store=Store(id="GB1459", name="", address="", postal_code="", locality=""),
-        )
-        mock_client = MagicMock()
-        mock_client.receipts.return_value = [receipt]
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["receipts"])
-        assert result.exit_code == 0
-        assert "GB1459" in result.output
+    client.receipts.return_value = newest_first()
+    result = CliRunner().invoke(cli, ["receipts", "--from", "2026-10-15", "--to", "2026-10-25"])
+    assert result.exit_code == 0, result.output
+    assert "t20" in result.output
+    assert "t29" not in result.output
 
 
-class TestCouponsCommand:
-    @patch("ilidl.cli._get_client")
-    def test_coupons_list_table(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.coupons.return_value = [_sample_coupon()]
-        mock_get_client.return_value = mock_client
+def test_receipt_json_serialises_decimals(client):
+    client.receipt.return_value = _receipt(29)
+    result = CliRunner().invoke(cli, ["receipt", "t29", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output)["total"] == 4.04
+    client.receipt.assert_called_once_with("t29")
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "list"])
-        assert result.exit_code == 0
-        assert "Free Pizza" in result.output
-        assert "2026-03-31" in result.output
-        assert "No" in result.output
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_list_json(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.coupons.return_value = [_sample_coupon()]
-        mock_get_client.return_value = mock_client
+def test_receipt_table_shows_quantity_and_discount(client):
+    item = Item(
+        article_id="0080755",
+        name="Sweet Potatoes",
+        quantity=Decimal("0.692"),
+        unit_price=Decimal("1.19"),
+        price=Decimal("0.82"),
+        vat_group="A",
+        discounts=[Discount("p1", "15% off coupon", Decimal("0.12"))],
+    )
+    client.latest_receipt.return_value = _receipt(29, items=[item], payment_method="CARD")
+    result = CliRunner().invoke(cli, ["receipt", "latest"])
+    assert result.exit_code == 0
+    assert "0.692" in result.output
+    assert "15% off coupon" in result.output
+    assert "-0.12" in result.output
+    assert "Paid by: CARD" in result.output
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "list", "--json"])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert len(data) == 1
-        assert data[0]["title"] == "Free Pizza"
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_list_empty(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.coupons.return_value = []
-        mock_get_client.return_value = mock_client
+def test_activate_all_skips_what_cannot_be_activated(client):
+    later = datetime.now(UTC) + timedelta(hours=3)
+    client.coupons.return_value = [
+        _coupon("ok"),
+        _coupon("active", is_activated=True),
+        _coupon("locked", is_locked=True),
+        _coupon("bakery", start_date=later),
+        _coupon("refused"),
+    ]
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "list"])
-        assert result.exit_code == 0
-        assert "No coupons available" in result.output
+    def activate(coupon_id):
+        if coupon_id == "refused":
+            raise CouponError(coupon_id, "PromotionIsProcessing")
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_activate_by_id(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_get_client.return_value = mock_client
+    client.activate_coupon.side_effect = activate
+    result = CliRunner().invoke(cli, ["coupons", "activate", "--all"])
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "activate", "c1"])
-        assert result.exit_code == 0
-        assert "Coupon activated" in result.output
-        mock_client.activate_coupon.assert_called_once_with("c1")
+    assert result.exit_code == 0
+    assert [c.args[0] for c in client.activate_coupon.call_args_list] == ["ok", "refused"]
+    assert "Activated: Coupon ok" in result.output
+    assert "Skipped: Coupon locked (locked)" in result.output
+    assert f"Skipped: Coupon bakery (starts {later:%Y-%m-%d %H:%M} UTC)" in result.output
+    assert "Skipped: Coupon refused (PromotionIsProcessing)" in result.output
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_activate_no_id_no_all(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_get_client.return_value = mock_client
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "activate"])
-        assert result.exit_code == 1
-        assert "Provide a coupon ID" in result.output
+def test_deactivate_reports_refusal_and_fails(client):
+    client.deactivate_coupon.side_effect = [None, CouponError("b", "not active")]
+    result = CliRunner().invoke(cli, ["coupons", "deactivate", "a", "b"])
+    assert result.exit_code == 1
+    assert "Deactivated: a" in result.output
+    assert "Not deactivated: b (not active)" in result.output
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_activate_all(self, mock_get_client):
-        inactive = _sample_coupon(id="c1", is_activated=False)
-        active = _sample_coupon(id="c2", is_activated=True)
-        mock_client = MagicMock()
-        mock_client.coupons.return_value = [inactive, active]
-        mock_get_client.return_value = mock_client
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "activate", "--all"])
-        assert result.exit_code == 0
-        assert "Activated" in result.output
-        mock_client.activate_coupon.assert_called_once_with("c1")
+def test_lidl_cookie_env_overrides_browser(monkeypatch):
+    monkeypatch.setenv("LIDL_COOKIE", "authToken=abc; ldi-session-info=x=y")
+    assert load_cookies("not-a-browser") == {"authToken": "abc", "ldi-session-info": "x=y"}
 
-    @patch("ilidl.cli._get_client")
-    def test_coupons_activate_all_skips_on_error(self, mock_get_client):
-        coupon = _sample_coupon(id="c1", is_activated=False)
-        mock_client = MagicMock()
-        mock_client.coupons.return_value = [coupon]
-        error_resp = MagicMock(status_code=409)
-        mock_client.activate_coupon.side_effect = httpx.HTTPStatusError(
-            "409",
-            request=MagicMock(),
-            response=error_resp,
-        )
-        mock_get_client.return_value = mock_client
 
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "activate", "--all"])
-        assert result.exit_code == 0
-        assert "Skipped" in result.output
-
-    @patch("ilidl.cli._get_client")
-    def test_coupons_deactivate(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_get_client.return_value = mock_client
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["coupons", "deactivate", "c1"])
-        assert result.exit_code == 0
-        assert "Coupon deactivated" in result.output
-        mock_client.deactivate_coupon.assert_called_once_with("c1")
+def test_unknown_browser(monkeypatch):
+    monkeypatch.delenv("LIDL_COOKIE", raising=False)
+    with pytest.raises(AuthError, match="Unknown browser"):
+        load_cookies("netscape")

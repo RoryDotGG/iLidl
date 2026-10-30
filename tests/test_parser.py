@@ -1,85 +1,84 @@
 """Tests for ilidl HTML receipt parser."""
 
-import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from ilidl.exceptions import ReceiptParseError
+from ilidl.models import Discount
 from ilidl.parser import parse_receipt_html
 
-FIXTURE = Path(__file__).parent / "fixtures" / "receipt_gb_sample.json"
+HTML = (Path(__file__).parent / "fixtures" / "receipt_gb.html").read_text()
 
 
-@pytest.fixture
-def sample_html():
-    data = json.loads(FIXTURE.read_text())
-    return data["htmlPrintedReceipt"]
+def test_items_skip_weighed_goods_weight_line():
+    result = parse_receipt_html(HTML)
+    assert [i.article_id for i in result.items] == ["5200601", "0001787", "0008028", "0080755"]
 
 
-class TestParseItems:
-    def test_item_count(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        assert len(result.items) == 7
-
-    def test_simple_item(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        beans = next(i for i in result.items if "Beans" in i.name)
-        assert beans.name == "Heinz Beans Standard"
-        assert beans.price == 2.74
-        assert beans.vat_group == "A"
-        assert beans.quantity == 1.0
-
-    def test_weight_item(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        carrots = next(i for i in result.items if "Carrots" in i.name)
-        assert carrots.name == "Loose Carrots 0082755"
-        assert carrots.price == 0.17
-        assert carrots.quantity == 0.24
-        assert carrots.unit_price == 0.69
-
-    def test_item_with_discount(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        handwash = next(i for i in result.items if "Handwash" in i.name)
-        assert len(handwash.discounts) == 1
-        assert handwash.discounts[0].description == "Price Cut"
-        assert handwash.discounts[0].amount == 0.04
+def test_multibuy():
+    rice = parse_receipt_html(HTML).items[0]
+    assert (rice.quantity, rice.unit_price, rice.price) == (
+        Decimal(2),
+        Decimal("0.55"),
+        Decimal("1.10"),
+    )
+    assert rice.vat_group == "A"
 
 
-class TestParseTotals:
-    def test_total(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        assert result.total == 12.38
-
-    def test_payment_method(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        assert result.payment_method == "CARD"
+def test_weighed_item_rounds_line_total():
+    potatoes = parse_receipt_html(HTML).items[3]
+    assert potatoes.quantity == Decimal("0.692")
+    assert potatoes.price == Decimal("0.82")
 
 
-class TestParseVat:
-    def test_vat_breakdown(self, sample_html):
-        result = parse_receipt_html(sample_html)
-        assert result.vat_breakdown["A"] == (5.16, 0.00)
-        assert result.vat_breakdown["B"] == (7.22, 1.20)
+def test_item_without_quantity_is_one():
+    biscuits = parse_receipt_html(HTML).items[1]
+    assert (biscuits.quantity, biscuits.price) == (1, Decimal("0.49"))
 
 
-class TestParseError:
-    def test_empty_html_raises(self):
-        with pytest.raises(ReceiptParseError) as exc_info:
-            parse_receipt_html("<html><body></body></html>")
-        assert exc_info.value.raw_html == "<html><body></body></html>"
+def test_discounts_attach_to_article_above():
+    items = parse_receipt_html(HTML).items
+    assert items[0].discounts == [
+        Discount("100001006-GB-TEMPLATE-GBAS000000001-1", "15% off coupon", Decimal("0.16"))
+    ]
+    assert items[2].discounts == [
+        Discount("100001000-GB-TEMPLATE-GBOF000000002-2", "£1 off with Lidl Plus", Decimal("1.00"))
+    ]
+    assert items[3].discounts == []
 
-    def test_no_items_raises(self):
-        with pytest.raises(ReceiptParseError):
-            parse_receipt_html("<html><body><pre></pre></body></html>")
 
-    def test_missing_total_raises(self):
-        html = (
-            "<html><body><pre>"
-            '<span class="article" data-art-id="1" '
-            'data-unit-price="2.00" data-tax-type="A" '
-            'data-art-description="Widget">Widget 2.00</span>'
-            "</pre></body></html>"
-        )
-        with pytest.raises(ReceiptParseError, match="Could not find TOTAL"):
-            parse_receipt_html(html)
+def test_old_style_discount_without_discount_class():
+    biscuits = parse_receipt_html(HTML).items[1]
+    assert biscuits.discounts == [Discount("", "Price Cut", Decimal("0.04"))]
+
+
+def test_line_totals_less_discounts_equal_total():
+    result = parse_receipt_html(HTML)
+    net = sum(i.price - sum(d.amount for d in i.discounts) for i in result.items)
+    assert net == result.total == Decimal("4.00")
+
+
+def test_payment_and_vat():
+    result = parse_receipt_html(HTML)
+    assert result.payment_method == "CARD"
+    assert result.vat_breakdown == {
+        "A": (Decimal("2.21"), Decimal("0.00")),
+        "B": (Decimal("1.79"), Decimal("0.30")),
+    }
+
+
+def test_no_items_raises():
+    with pytest.raises(ReceiptParseError, match="No items"):
+        parse_receipt_html("<html><body><pre></pre></body></html>")
+
+
+def test_cut_off_total_falls_back_to_line_sum():
+    html = HTML.replace('class="css_bold">4.00<', 'class="css_bold">4.0<')
+    assert parse_receipt_html(html).total == Decimal("4.00")
+
+
+def test_weight_line_sharing_the_item_line_id_is_skipped():
+    html = HTML.replace('id="purchase_list_line_9"', 'id="purchase_list_line_8"')
+    assert len(parse_receipt_html(html).items) == 4
