@@ -10,11 +10,28 @@ Each feature of the website is a separate app with its own backend under
 
 | Piece | Source | Needed for |
 |---|---|---|
-| `authToken`, `ldi-session-info` cookies | Logging in on the website (HttpOnly). `authToken` is a JWT that lasts 30 minutes; the website renews it while open | Everything. Reads need only these |
+| `authToken`, `ldi-session-info` cookies | Logging in on the website (HttpOnly). `authToken` is a JWT that lasts 30 minutes (see [renewing](#renewing-the-session)) | Everything. Reads need only these |
 | Bearer JWT | `GET /mla/api/v1/token` returns `{token, source}`. Issued by accounts.lidl.com, lasts 30 minutes | Coupon changes |
 | `X-CSRF-TOKEN` header | Value of the `XSRF-TOKEN` cookie set by `GET /prm/antiforgerytoken` (send the bearer token) | Coupon changes |
 
 Without a valid session, API calls return 401 and `/mla/api/v1/token` redirects to the login page.
+
+### Renewing the session
+
+There is no refresh endpoint. A logged-out page request starts the OAuth code flow, and while the
+accounts.lidl.com login is still valid it completes without showing anything:
+
+1. `/user-api/login?step=login&redirect=...` sets `ldi_redirect` and redirects to
+   `/user-api/oauth2/authorization/sso-gb`.
+2. That sets `authorization-request` and redirects to `https://accounts.lidl.com/connect/authorize`
+   (`client_id=greatbritainretailclient`, `scope=openid profile Lidl.Authentication
+   offline_access`, PKCE, `redirect_uri=https://www.lidl.co.uk/user-api/signin-oidc`).
+3. accounts.lidl.com redirects to `/user-api/signin-oidc?code=...`, which sets fresh session
+   cookies and redirects back to the original URL.
+
+If the accounts.lidl.com login has expired, step 3 shows its login page instead. iLidl follows
+this chain from `GET /mla/api/v1/token` with the browser's lidl.co.uk and accounts.lidl.com
+cookies.
 
 ## Receipts (`/mre`)
 

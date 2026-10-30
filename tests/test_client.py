@@ -180,3 +180,61 @@ def test_receipt_dates_are_uk_local_time_despite_utc_label():
     )
     [receipt] = client.receipts()
     assert receipt.date.astimezone(UTC) == datetime(2026, 5, 17, 12, 15, 48, tzinfo=UTC)
+
+
+def _expiring_site(accounts_logged_in: bool, visited: list[str]):
+    """Fake lidl.co.uk whose session renews through accounts.lidl.com like the real site."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = request.url
+        visited.append(f"{url.host}{url.path}")
+        fresh = "authToken=fresh" in request.headers.get("cookie", "")
+        if url.host == "accounts.lidl.com":
+            if not accounts_logged_in:
+                return httpx.Response(200, text="<html>Log in</html>")
+            return httpx.Response(
+                302, headers={"location": "https://www.lidl.co.uk/user-api/signin-oidc?code=c"}
+            )
+        if url.path == "/user-api/login":
+            return httpx.Response(
+                302, headers={"location": "https://accounts.lidl.com/connect/authorize"}
+            )
+        if url.path == "/user-api/signin-oidc":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "/mla/api/v1/token?country_code=gb",
+                    "set-cookie": "authToken=fresh; Path=/; Secure; HttpOnly",
+                },
+            )
+        if url.path == "/mla/api/v1/token":
+            if fresh:
+                return httpx.Response(200, json={"token": "jwt", "source": "3"})
+            return httpx.Response(302, headers={"location": "/user-api/login?step=login"})
+        if url.path == "/mre/api/v1/tickets":
+            if not fresh:
+                return httpx.Response(401)
+            return httpx.Response(200, json={"items": [], "page": 1, "size": 10, "totalCount": 0})
+        return httpx.Response(404)
+
+    return handler
+
+
+def test_expired_session_renews_through_accounts_and_retries():
+    visited: list[str] = []
+    client = LidlClient(
+        {"authToken": "stale"}, transport=httpx.MockTransport(_expiring_site(True, visited))
+    )
+    assert list(client.receipts()) == []
+    assert "accounts.lidl.com/connect/authorize" in visited
+    assert visited[-1] == "www.lidl.co.uk/mre/api/v1/tickets"
+
+
+def test_expired_accounts_login_raises_auth_error():
+    visited: list[str] = []
+    client = LidlClient(
+        {"authToken": "stale"}, transport=httpx.MockTransport(_expiring_site(False, visited))
+    )
+    with pytest.raises(AuthError, match="could not be renewed"):
+        client.check_session()
+    assert "accounts.lidl.com/connect/authorize" in visited

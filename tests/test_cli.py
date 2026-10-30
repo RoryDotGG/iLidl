@@ -159,3 +159,50 @@ def test_unreadable_cookie_db_on_macos_explains_full_disk_access(monkeypatch):
     monkeypatch.setattr(auth.sys, "platform", "darwin")
     with pytest.raises(AuthError, match="Full Disk Access.*LIDL_COOKIE"):
         load_cookies("brave")
+
+
+def test_browser_cookies_keep_only_lidl_session_hosts(monkeypatch):
+    from http.cookiejar import Cookie
+
+    from ilidl import auth
+
+    def cookie(domain):
+        return Cookie(
+            0,
+            "c",
+            "v",
+            None,
+            False,
+            domain,
+            True,
+            domain.startswith("."),
+            "/",
+            True,
+            True,
+            None,
+            False,
+            None,
+            None,
+            {},
+        )
+
+    def brave(domain_name):
+        assert domain_name == "lidl"
+        return [
+            cookie(d)
+            for d in (
+                "www.lidl.co.uk",
+                ".lidl.co.uk",
+                "accounts.lidl.com",
+                "lidlplus.com",
+                "notlidl.co.uk",
+            )
+        ]
+
+    monkeypatch.delenv("LIDL_COOKIE", raising=False)
+    monkeypatch.setitem(auth.BROWSERS, "brave", brave)
+    assert sorted(c.domain for c in load_cookies("brave")) == [
+        ".lidl.co.uk",
+        "accounts.lidl.com",
+        "www.lidl.co.uk",
+    ]

@@ -40,9 +40,11 @@ work because the session cookie is HttpOnly.
 export LIDL_COOKIE='authToken=...; ldi-session-info=...'
 ```
 
-The session token (`authToken`) lasts 30 minutes, and the browser only renews it while it has
-lidl.co.uk open. If commands fail with "Lidl session expired", open
-[your receipts](https://www.lidl.co.uk/mre/) in the browser (logging in if asked) and retry.
+The session token (`authToken`) lasts 30 minutes. When it has expired, iLidl renews it the way the
+website does, using your accounts.lidl.com login from the same browser. If that login has expired
+too, commands fail with "Lidl session expired": log in at
+[lidl.co.uk/mre](https://www.lidl.co.uk/mre/) in the browser and retry. A `LIDL_COOKIE` session
+cannot be renewed, so it stops working after 30 minutes.
 
 ## CLI usage
 

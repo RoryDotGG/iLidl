@@ -1,4 +1,4 @@
-"""Load the lidl.co.uk session cookies from a logged-in browser."""
+"""Load the Lidl session cookies from a logged-in browser."""
 
 import os
 import sys
@@ -10,13 +10,15 @@ from ilidl.exceptions import AuthError
 
 BROWSERS = {fn.__name__: fn for fn in browser_cookie3.all_browsers}
 COOKIE_ENV = "LIDL_COOKIE"
+# accounts.lidl.com holds the login that renews the 30-minute lidl.co.uk session.
+_DOMAINS = ("lidl.co.uk", "accounts.lidl.com")
 
 
 def load_cookies(browser: str) -> CookieJar | dict[str, str]:
-    """Return lidl.co.uk cookies.
+    """Return the lidl.co.uk and accounts.lidl.com cookies.
 
     ``LIDL_COOKIE`` (a ``Cookie`` header copied from the browser's DevTools) wins over the
-    browser's cookie store.
+    browser's cookie store. It holds only lidl.co.uk cookies, so the session cannot be renewed.
 
     Raises:
         AuthError: If the browser is unknown or its cookie store cannot be read.
@@ -28,7 +30,8 @@ def load_cookies(browser: str) -> CookieJar | dict[str, str]:
         msg = f"Unknown browser {browser!r}. Choose one of: {', '.join(BROWSERS)}"
         raise AuthError(msg)
     try:
-        return BROWSERS[browser](domain_name="lidl.co.uk")
+        # domain_name is a substring match, so filter to the hosts the client talks to.
+        found = BROWSERS[browser](domain_name="lidl")
     except browser_cookie3.BrowserCookieError as exc:
         msg = f"Could not read {browser} cookies ({exc})."
         # browser_cookie3 hides the OS error, but on macOS this is almost always privacy
@@ -41,3 +44,9 @@ def load_cookies(browser: str) -> CookieJar | dict[str, str]:
             )
         msg += f" Or set {COOKIE_ENV} instead."
         raise AuthError(msg) from exc
+    jar = CookieJar()
+    for cookie in found:
+        host = cookie.domain.lstrip(".")
+        if any(host == d or host.endswith(f".{d}") for d in _DOMAINS):
+            jar.set_cookie(cookie)
+    return jar

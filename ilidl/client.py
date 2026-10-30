@@ -83,14 +83,31 @@ class LidlClient:
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         resp = self._http.request(method, path, **kwargs)
         # An expired session gives 401 on API calls and a redirect to the login page on /mla.
-        if resp.status_code == 401 or resp.is_redirect:
+        # Writes are not retried: they fetch the bearer token first, which renews the session.
+        if _logged_out(resp) and method == "GET" and self._renew_session():
+            resp = self._http.request(method, path, **kwargs)
+        if _logged_out(resp):
             msg = (
-                "Lidl session expired or missing. The session token lasts 30 minutes and the"
-                " browser only renews it while lidl.co.uk is open: open https://www.lidl.co.uk/mre/"
-                " in your browser (log in if asked) and retry."
+                "Lidl session expired and could not be renewed. Log in at"
+                " https://www.lidl.co.uk/mre/ in your browser and retry."
             )
             raise AuthError(msg)
         return resp
+
+    def _renew_session(self) -> bool:
+        """Get a fresh ``authToken``, which lasts 30 minutes, the way the website does.
+
+        A logged-out request redirects through ``/user-api/login`` to accounts.lidl.com, which
+        redirects straight back with a code while its own login lasts, and
+        ``/user-api/signin-oidc`` then sets new session cookies. Needs the accounts.lidl.com
+        cookies in the jar. Returns whether the chain ended back on the token endpoint.
+        """
+        self._write_headers_expire = 0.0
+        try:
+            resp = self._http.get("/mla/api/v1/token", follow_redirects=True)
+        except httpx.TooManyRedirects:
+            return False
+        return resp.status_code == 200 and resp.url.path == "/mla/api/v1/token"
 
     def _get(self, path: str, **params: Any) -> Any:
         resp = self._request("GET", path, params=params)
@@ -220,6 +237,10 @@ class LidlClient:
         self._write_headers = {**auth, "X-CSRF-TOKEN": xsrf}
         self._write_headers_expire = time.monotonic() + _TOKEN_TTL_SECONDS
         return self._write_headers
+
+
+def _logged_out(resp: httpx.Response) -> bool:
+    return resp.status_code == 401 or resp.is_redirect
 
 
 def _receipt_date(value: str) -> datetime:
