@@ -144,3 +144,18 @@ def test_unknown_browser(monkeypatch):
     monkeypatch.delenv("LIDL_COOKIE", raising=False)
     with pytest.raises(AuthError, match="Unknown browser"):
         load_cookies("netscape")
+
+
+def test_unreadable_cookie_db_on_macos_explains_full_disk_access(monkeypatch):
+    import browser_cookie3
+
+    from ilidl import auth
+
+    def blocked(domain_name):
+        raise browser_cookie3.BrowserCookieError("Unable to read database file")
+
+    monkeypatch.delenv("LIDL_COOKIE", raising=False)
+    monkeypatch.setitem(auth.BROWSERS, "brave", blocked)
+    monkeypatch.setattr(auth.sys, "platform", "darwin")
+    with pytest.raises(AuthError, match="Full Disk Access.*LIDL_COOKIE"):
+        load_cookies("brave")

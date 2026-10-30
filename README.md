@@ -23,19 +23,26 @@ ilidl login --browser brave
 
 This checks the session works and saves the browser name to `~/.config/ilidl/config.toml`.
 Cookies are read from the browser on every run, so iLidl picks up the browser's refreshed session.
-On macOS the first run asks for Keychain access to the browser's "Safe Storage" key.
+On macOS the first run asks for Keychain access to the browser's "Safe Storage" key. If it fails
+with "Unable to read database file", macOS is blocking your terminal app from reading the
+browser's data: add the terminal app under System Settings > Privacy & Security > Full Disk
+Access, then restart it.
 
 Supported browsers: `arc`, `brave`, `chrome`, `chromium`, `edge`, `firefox`, `librewolf`, `opera`,
 `opera_gx`, `safari`, `vivaldi` (via [browser-cookie3](https://github.com/borisbabic/browser_cookie3)).
 
-If the cookie store cannot be read, copy the `Cookie` request header for `www.lidl.co.uk` from your
-browser's DevTools and set it instead:
+If the cookie store cannot be read, copy the cookies from DevTools instead. Open
+[your receipts](https://www.lidl.co.uk/mre/), then in DevTools > Network pick a request to
+`www.lidl.co.uk/mre/api/...` and copy its `Cookie` request header. `document.cookie` will not
+work because the session cookie is HttpOnly.
 
 ```bash
 export LIDL_COOKIE='authToken=...; ldi-session-info=...'
 ```
 
-When the session expires, commands fail with "Lidl session expired". Log in on the website again.
+The session token (`authToken`) lasts 30 minutes, and the browser only renews it while it has
+lidl.co.uk open. If commands fail with "Lidl session expired", open
+[your receipts](https://www.lidl.co.uk/mre/) in the browser (logging in if asked) and retry.
 
 ## CLI usage
 

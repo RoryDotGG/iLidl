@@ -84,7 +84,11 @@ class LidlClient:
         resp = self._http.request(method, path, **kwargs)
         # An expired session gives 401 on API calls and a redirect to the login page on /mla.
         if resp.status_code == 401 or resp.is_redirect:
-            msg = "Lidl session expired or missing. Log in at https://www.lidl.co.uk and retry."
+            msg = (
+                "Lidl session expired or missing. The session token lasts 30 minutes and the"
+                " browser only renews it while lidl.co.uk is open: open https://www.lidl.co.uk/mre/"
+                " in your browser (log in if asked) and retry."
+            )
             raise AuthError(msg)
         return resp
 

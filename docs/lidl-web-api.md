@@ -10,7 +10,7 @@ Each feature of the website is a separate app with its own backend under
 
 | Piece | Source | Needed for |
 |---|---|---|
-| `authToken`, `ldi-session-info` cookies | Logging in on the website (HttpOnly) | Everything. Reads need only these |
+| `authToken`, `ldi-session-info` cookies | Logging in on the website (HttpOnly). `authToken` is a JWT that lasts 30 minutes; the website renews it while open | Everything. Reads need only these |
 | Bearer JWT | `GET /mla/api/v1/token` returns `{token, source}`. Issued by accounts.lidl.com, lasts 30 minutes | Coupon changes |
 | `X-CSRF-TOKEN` header | Value of the `XSRF-TOKEN` cookie set by `GET /prm/antiforgerytoken` (send the bearer token) | Coupon changes |
 
