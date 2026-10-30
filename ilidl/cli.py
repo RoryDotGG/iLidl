@@ -12,7 +12,7 @@ import click
 from ilidl.auth import BROWSERS, COOKIE_ENV, load_cookies
 from ilidl.client import LidlClient
 from ilidl.config import Config
-from ilidl.exceptions import CouponError, ILidlError
+from ilidl.exceptions import AuthError, CouponError, ILidlError
 from ilidl.models import Coupon
 
 
@@ -20,6 +20,10 @@ class _Cli(click.Group):
     def invoke(self, ctx: click.Context) -> Any:
         try:
             return super().invoke(ctx)
+        except AuthError as exc:
+            raise click.ClickException(
+                f"{exc}\nRun `ilidl doctor` for a step-by-step check."
+            ) from exc
         except ILidlError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -71,6 +75,38 @@ def login(browser: str) -> None:
     config.browser = browser
     config.save()
     click.echo(f"Logged in using {browser} cookies. Saved to {config.path}")
+
+
+_MARKS = {"ok": ("✓", "green"), "warn": ("!", "yellow"), "fail": ("✗", "red")}
+
+
+@cli.command()
+@click.option(
+    "--browser",
+    type=click.Choice(sorted(BROWSERS)),
+    default=None,
+    help="Browser to check instead of the one saved by login",
+)
+def doctor(browser: str | None) -> None:
+    """Check cookies, session and API access, and say how to fix problems."""
+    from ilidl import doctor as checks
+
+    click.echo("iLidl doctor\n")
+    failed = warned = 0
+    for check in checks.run(browser or Config().browser):
+        mark, colour = _MARKS[check.status]
+        click.echo(f"  {click.style(mark, fg=colour, bold=True)} {check.title:<24} {check.detail}")
+        if check.fix:
+            click.echo(f"    {click.style('→ ' + check.fix, fg=colour)}")
+        failed += check.status == "fail"
+        warned += check.status == "warn"
+
+    click.echo()
+    if failed:
+        click.echo(click.style("Found a problem. Fix it and run ilidl doctor again.", fg="red"))
+        raise SystemExit(1)
+    summary = f"All good, with {warned} warning{'s' * (warned != 1)}." if warned else "All good."
+    click.echo(click.style(summary, fg="yellow" if warned else "green"))
 
 
 @cli.command("receipts")

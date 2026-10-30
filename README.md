@@ -46,6 +46,26 @@ too, commands fail with "Lidl session expired": log in at
 [lidl.co.uk/mre](https://www.lidl.co.uk/mre/) in the browser and retry. A `LIDL_COOKIE` session
 cannot be renewed, so it stops working after 30 minutes.
 
+### Troubleshooting
+
+`ilidl doctor` runs through the setup as a checklist and says how to fix each problem: which
+browser it reads, whether the cookies can be read, whether you are logged in, when the session
+token expires, whether it can be renewed, and whether receipts and coupons load. It never prints
+cookie values.
+
+```text
+  ✓ Cookie source            brave browser
+  ✓ Read cookies             15 lidl.co.uk, 7 accounts.lidl.com
+  ✓ Logged in to lidl.co.uk  authToken cookie found
+  ✓ Session token            Expired at 12:54, iLidl will renew it
+  ✓ Renewal login            accounts.lidl.com cookies found
+  ✓ Lidl session             Renewed and signed in
+  ✓ Receipts                 Latest 29 Oct 2026, £12.17 at Llandaff
+  ✓ Coupons                  17 available, 16 active
+```
+
+Use `ilidl doctor --browser chrome` to check a browser before running `login`.
+
 ## CLI usage
 
 ```bash
